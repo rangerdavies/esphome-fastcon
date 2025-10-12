@@ -3,27 +3,45 @@
 #include "esphome/components/light/light_state.h"
 #include "fastcon_controller.h"
 #include "fastcon_light.h"
-#include "version.h"
+
+#ifndef FASTCON_VERSION
+#define FASTCON_VERSION "0.3.3-dev"
+#endif
 
 namespace esphome {
 namespace fastcon {
 
 static const char *const TAG = "fastcon.light";
 
-void FastconLight::write_state(light::LightState *state) {
-  // Delegate channel resolution & payload building to the controller.
-  // This avoids coupling the light output to any controller-specific enums/APIs.
+light::LightTraits FastconLight::get_traits() {
+  light::LightTraits t;
+  if (supports_cwww_) {
+    t.set_supported_color_modes({light::ColorMode::RGB_COLD_WARM_WHITE});
+    t.set_min_mireds(153.0f);
+    t.set_max_mireds(500.0f);
+  } else {
+    t.set_supported_color_modes({light::ColorMode::RGB_WHITE});
+  }
+  return t;
+}
 
-  // Build manufacturer payload for this light state
+void FastconLight::write_state(light::LightState *state) {
+  if (this->controller_ == nullptr) {
+    ESP_LOGW(TAG, "No controller bound; dropping command");
+    return;
+  }
+
+  // Ask the controller to compute the 6-byte light frame from current_values (fixes plain ON)
   std::vector<uint8_t> light_bytes = this->controller_->get_light_data(state);
-  std::vector<uint8_t> payload      = this->controller_->single_control(this->light_id_, light_bytes);
+
+  // Wrap into inner payload for this light_id
+  std::vector<uint8_t> payload = this->controller_->single_control(this->light_id_, light_bytes);
 
   // Queue it for advertisement
   this->controller_->queueCommand(this->light_id_, payload);
 
-  // Optional: lightweight log with version
-  ESP_LOGD(TAG, "Queued state v%s: light_id=%u, payload_len=%d", FASTCON_VERSION,
-           (unsigned)this->light_id_, (int)payload.size());
+  ESP_LOGD(TAG, "Queued state v%s: light_id=%u, payload_len=%d",
+           FASTCON_VERSION, (unsigned)this->light_id_, (int)payload.size());
 }
 
 }  // namespace fastcon
