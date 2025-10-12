@@ -1,13 +1,8 @@
-
 #pragma once
 #include "esphome/components/light/light_state.h"
+#include "version.h"
 
 namespace esphome { namespace fastcon {
-
-// Version for logging purposes only
-#ifndef FASTCON_VERSION
-#define FASTCON_VERSION "0.3.1-dev"
-#endif
 
 // Resolve final channel levels (0..1) from LightState current values.
 // - Uses current_values helpers so brightness/color_brightness are applied
