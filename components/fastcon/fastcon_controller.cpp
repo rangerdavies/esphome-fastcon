@@ -5,7 +5,10 @@
 #include "esphome/components/light/light_state.h"
 #include "fastcon_controller.h"
 #include "protocol.h"
-#include "version.h"
+
+#ifndef FASTCON_VERSION
+#define FASTCON_VERSION "0.3.2-dev"
+#endif
 
 namespace esphome {
 namespace fastcon {
