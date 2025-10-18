@@ -174,8 +174,24 @@ std::vector<uint8_t> FastconController::single_control(uint32_t light_id_, const
   std::copy(light_data.begin(), light_data.end(), result_data.begin() + 2);
 
   // Debug output - print payload as hex
-  auto hex_str = vector_to_hex_string(result_data).data();
-  ESP_LOGD(TAG, "Inner Payload v%s (%d bytes): %s", FASTCON_VERSION, (int)result_data.size(), hex_str);
+  //auto hex_str = vector_to_hex_string(result_data).data();
+  //ESP_LOGD(TAG, "Inner Payload v%s (%d bytes): %s", FASTCON_VERSION, (int)result_data.size(), hex_str);
+  // Good: print as hex, bounded by 'len'
+  static inline std::string to_hex(const uint8_t* data, size_t len) {
+    static const char* kHex = "0123456789ABCDEF";
+    std::string out;
+    out.reserve(len * 2);
+    for (size_t i = 0; i < len; ++i) {
+      out.push_back(kHex[data[i] >> 4]);
+      out.push_back(kHex[data[i] & 0x0F]);
+    }
+    return out;
+  }
+  
+  // ...
+  const uint8_t* p = inner_payload.data();
+  const size_t   n = inner_payload.size();   // should be 12
+  ESP_LOGD("fastcon.controller", "Inner Payload (%u bytes): %s", (unsigned)n, to_hex(p, n).c_str());
 
   return this->generate_command(5, light_id_, result_data, true);
 }
