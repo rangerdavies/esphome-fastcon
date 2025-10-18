@@ -191,9 +191,8 @@ std::vector<uint8_t> FastconController::single_control(uint32_t light_id_,
   // Copy payload safely
   std::copy(light_data.begin(), light_data.end(), result_data.begin() + kHeader);
 
-  // Debug: hex dump with bounded size; our vector_to_hex_string() returns std::vector<char>
-  const auto hex_vec = vector_to_hex_string(result_data);           // std::vector<char>
-  const std::string hex(hex_vec.begin(), hex_vec.end());            // make a real string
+  // Debug: hex dump with bounded size
+  const std::string hex = vector_to_hex_string(result_data);
   ESP_LOGD(TAG, "Inner Payload v%s (%zu bytes): %s",
            FASTCON_VERSION, result_data.size(), hex.c_str());
 
