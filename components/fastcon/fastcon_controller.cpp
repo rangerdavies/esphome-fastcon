@@ -169,10 +169,23 @@ std::vector<uint8_t> FastconController::get_light_data(light::LightState *state)
 
 std::vector<uint8_t> FastconController::single_control(uint32_t light_id_,
                                                        const std::vector<uint8_t> &light_data) {
-  // Inner payload = 2-byte header + light_data
-  const size_t kHeader = 2;
-  const size_t data_len = light_data.size();
-  std::vector<uint8_t> result_data(kHeader + data_len);
+  // ---- Protocol constraints ----
+  // If your wire format really must be 12 bytes total, enforce it:
+  constexpr size_t kMaxTotal = 12;
+  constexpr size_t kHeader   = 2;  // [0]=type|len_nibble, [1]=light_id (1 byte)
+  const size_t     kMaxData  = kMaxTotal - kHeader; // 10 bytes
+  if (light_data.size() > kMaxData) {
+    ESP_LOGW(TAG, "Truncating light_data from %zu to %zu bytes to fit protocol",
+             light_data.size(), kMaxData);
+  }
+  const size_t data_len = std::min(light_data.size(), kMaxData);
+
+  // If the protocol allows variable payloads, use this instead:
+  //const size_t kHeader   = 2;
+  //const size_t data_len  = light_data.size();
+  //const size_t total_len = kHeader + data_len;
+
+  std::vector<uint8_t> result_data(total_len);
 
   // Header byte 0:
   //  - low 4 bits: message type (2)
