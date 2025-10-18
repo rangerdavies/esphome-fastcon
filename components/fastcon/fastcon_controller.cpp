@@ -185,7 +185,7 @@ std::vector<uint8_t> FastconController::single_control(uint32_t light_id_,
   //const size_t data_len  = light_data.size();
   //const size_t total_len = kHeader + data_len;
 
-  //std::vector<uint8_t> result_data(total_len);
+  std::vector<uint8_t> result_data(total_len);
 
   // Header byte 0:
   //  - low 4 bits: message type (2)
