@@ -167,16 +167,48 @@ std::vector<uint8_t> FastconController::get_light_data(light::LightState *state)
   return light_data;
 }
 
-std::vector<uint8_t> FastconController::single_control(uint32_t light_id_, const std::vector<uint8_t> &light_data) {
-  std::vector<uint8_t> result_data(12);
-  result_data[0] = 2 | (((0x0FFFFFF & (light_data.size() + 1)) << 4));
-  result_data[1] = light_id_;
-  std::copy(light_data.begin(), light_data.end(), result_data.begin() + 2);
+std::vector<uint8_t> FastconController::single_control(uint32_t light_id_,
+                                                       const std::vector<uint8_t> &light_data) {
+  // ---- Protocol constraints ----
+  // If your wire format really must be 12 bytes total, enforce it:
+  // constexpr size_t kMaxTotal = 12;
+  // constexpr size_t kHeader   = 2;  // [0]=type|len_nibble, [1]=light_id (1 byte)
+  // const size_t     kMaxData  = kMaxTotal - kHeader; // 10 bytes
+  // if (light_data.size() > kMaxData) {
+  //   ESP_LOGW(TAG, "Truncating light_data from %zu to %zu bytes to fit protocol",
+  //            light_data.size(), kMaxData);
+  // }
+  // const size_t data_len = std::min(light_data.size(), kMaxData);
 
-  // Debug output - print payload as hex
-  auto hex_str = vector_to_hex_string(result_data).data();
-  ESP_LOGD(TAG, "Inner Payload v%s (%d bytes): %s", FASTCON_VERSION, (int)result_data.size(), hex_str);
+  // If the protocol allows variable payloads, use this instead:
+  const size_t kHeader   = 2;
+  const size_t data_len  = light_data.size();
+  const size_t total_len = kHeader + data_len;
 
+  std::vector<uint8_t> result_data(total_len);
+
+  // ---- Header byte 0: low 4 bits = type(=2?), high 4 bits = length nibble ----
+  // If the protocol encodes (data_len+1) in the upper nibble, mask to 4 bits.
+  const uint8_t type_nibble = 0x02 & 0x0F;                 // "2" from your code
+  const uint8_t len_nibble  = static_cast<uint8_t>((data_len + 1) & 0x0F);
+  result_data[0] = static_cast<uint8_t>((len_nibble << 4) | type_nibble);
+
+  // ---- Header byte 1: light ID (1 byte). Validate and clamp explicitly. ----
+  if (light_id_ > 0xFF) {
+    ESP_LOGW(TAG, "light_id (%u) exceeds 1 byte; truncating to 0x%02X",
+             (unsigned)light_id_, (unsigned)(light_id_ & 0xFF));
+  }
+  result_data[1] = static_cast<uint8_t>(light_id_ & 0xFF);
+
+  // ---- Copy payload safely (no overflow) ----
+  std::copy_n(light_data.begin(), data_len, result_data.begin() + kHeader);
+
+  // ---- Debug output: stable hex + correct length specifier ----
+  const std::string hex = vector_to_hex_string(result_data);  // returns std::string
+  ESP_LOGD(TAG, "Inner Payload v%s (%zu bytes): %s",
+           FASTCON_VERSION, result_data.size(), hex.c_str());
+
+  // ---- Build the outer command ----
   return this->generate_command(5, light_id_, result_data, true);
 }
 
