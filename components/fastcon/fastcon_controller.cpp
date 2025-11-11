@@ -167,6 +167,27 @@ std::vector<uint8_t> FastconController::get_light_data(light::LightState *state)
   return light_data;
 }
 
+// special payload for white LED with color_interlock 
+std::vector<uint8_t> FastconController::get_white_light_data(light::LightState *state) {
+  auto &values = state->current_values;
+  const bool is_on = values.is_on();
+  if (!is_on) {
+    return std::vector<uint8_t>({0x00});
+  }
+
+  const float blevel = std::min(values.get_brightness() * 127.0f, 127.0f);
+  std::vector<uint8_t> light_data = {
+      static_cast<uint8_t>(0x80 | static_cast<uint8_t>(blevel)),
+      0,
+      0,
+      0,
+      127, // Warm
+      127  // Cold
+  };
+
+  return light_data;
+}
+
 std::vector<uint8_t> FastconController::single_control(uint32_t light_id_, const std::vector<uint8_t> &light_data) {
   std::vector<uint8_t> result_data(12);
   result_data[0] = 2 | (((0x0FFFFFF & (light_data.size() + 1)) << 4));

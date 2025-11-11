@@ -43,8 +43,19 @@ void FastconLight::write_state(light::LightState *state) {
     return;
   }
 
-  // Ask the controller to compute the 6-byte light frame from current_values (fixes plain ON)
-  std::vector<uint8_t> light_bytes = this->controller_->get_light_data(state);
+  std::vector<uint8_t> light_bytes;
+  auto &values = state->current_values;
+
+  // Determine if it's a "white-only" command
+  bool is_white_only = values.get_color_mode() == light::ColorMode::WHITE;
+
+  if (is_white_only) {
+    ESP_LOGD(TAG, "Sending white-only command for light %u", (unsigned)this->light_id_);
+    light_bytes = this->controller_->get_white_light_data(state);
+  } else {
+    ESP_LOGD(TAG, "Sending RGB/color command for light %u", (unsigned)this->light_id_);
+    light_bytes = this->controller_->get_light_data(state);
+  }
 
   // Wrap into inner payload for this light_id
   std::vector<uint8_t> payload = this->controller_->single_control(this->light_id_, light_bytes);
