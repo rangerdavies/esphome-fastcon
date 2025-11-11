@@ -15,13 +15,25 @@ static const char *const TAG = "fastcon.light";
 
 light::LightTraits FastconLight::get_traits() {
   light::LightTraits t;
-  if (supports_cwww_) {
-    t.set_supported_color_modes({light::ColorMode::RGB_COLD_WARM_WHITE});
+  if (this->color_interlock_) {
+    if (this->supports_cwww_) {
+      t.set_supported_color_modes({light::ColorMode::RGB, light::ColorMode::COLD_WARM_WHITE});
+    } else {
+      t.set_supported_color_modes({light::ColorMode::RGB, light::ColorMode::WHITE});
+    }
+  } else {
+    if (this->supports_cwww_) {
+      t.set_supported_color_modes({light::ColorMode::RGB_COLD_WARM_WHITE});
+    } else {
+      t.set_supported_color_modes({light::ColorMode::RGB_WHITE});
+    }
+  }
+
+  if (this->supports_cwww_) {
     t.set_min_mireds(153.0f);
     t.set_max_mireds(500.0f);
-  } else {
-    t.set_supported_color_modes({light::ColorMode::RGB_WHITE});
   }
+  
   return t;
 }
 

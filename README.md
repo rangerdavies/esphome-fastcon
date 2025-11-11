@@ -51,6 +51,8 @@ light:
     id: living_room_light
     name: "Living Room Light"
     light_id: 1           # ID of the light (1-255)
+    supports_cwww: true   # Optional: Set to true if the light supports cold/warm white
+    color_interlock: true # Optional: Set to true to prevent RGB and white LEDs from being on at the same time
 ```
 
 ### Configuration Variables
@@ -71,6 +73,8 @@ light:
 - **name** (*Required*, string): The name for the light entity
 - **id** (*Optional*, ID): The ID to use for this light component
 - **controller_id** (*Optional*, ID): The ID of the controller to use. Defaults to "fastcon_controller"
+- **supports_cwww** (*Optional*, boolean): Set to `true` if the light supports cold/warm white channels. Defaults to `false`.
+- **color_interlock** (*Optional*, boolean): Set to `true` to prevent RGB and white LEDs from being on at the same time. Defaults to `false`.
 
 ## Finding Your Mesh Key
 

@@ -17,6 +17,7 @@ class FastconLight : public Component, public light::LightOutput {
   void set_controller(FastconController *c) { controller_ = c; }
   void set_light_id(uint8_t id) { light_id_ = id; }
   void set_supports_cwww(bool v) { supports_cwww_ = v; }
+  void set_color_interlock(bool v) { color_interlock_ = v; }
 
   // LightOutput interface
   light::LightTraits get_traits() override;
@@ -26,6 +27,7 @@ class FastconLight : public Component, public light::LightOutput {
   FastconController *controller_{nullptr};
   uint8_t light_id_{0};
   bool supports_cwww_{false};
+  bool color_interlock_{false};
 };
 
 }  // namespace fastcon
