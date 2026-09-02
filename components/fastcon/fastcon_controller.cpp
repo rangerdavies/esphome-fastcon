@@ -73,10 +73,36 @@ void FastconController::loop() {
       adv_data_raw[adv_data_len++] = ESP_BLE_ADV_FLAG_BREDR_NOT_SPT | ESP_BLE_ADV_FLAG_GEN_DISC;
 
       // Manufacturer data
-      adv_data_raw[adv_data_len++] = cmd.data.size() + 2;
+      // Length byte per BLE Core spec: covers AD Type (1) + Company ID (2) + payload,
+      // i.e. cmd.data.size() + 3 - NOT + 2. The old +2 declared this AD structure one
+      // byte short of its real contents, producing a malformed raw-advertising buffer
+      // that esp_ble_gap_config_adv_data_raw() rejects (confirmed live: err=258
+      // ESP_ERR_INVALID_ARG on literally the first command processed after boot).
+      adv_data_raw[adv_data_len++] = cmd.data.size() + 3;
       adv_data_raw[adv_data_len++] = ESP_BLE_AD_MANUFACTURER_SPECIFIC_TYPE;
       adv_data_raw[adv_data_len++] = MANUFACTURER_DATA_ID & 0xFF;
       adv_data_raw[adv_data_len++] = (MANUFACTURER_DATA_ID >> 8) & 0xFF;
+
+      // Bounds check - legacy BLE advertising is capped at 31 bytes total, and
+      // adv_data_raw is sized to match. Control frames (24 bytes) fit; membership-write
+      // frames (set_group_members(), padded to 18 bytes -> 30 bytes after
+      // generate_command()/prepare_payload() framing) do NOT - adv_data_len + 30 = 37,
+      // 6 bytes past the end of a 31-byte stack array. The old code had no check here
+      // and silently ran memcpy() past the buffer, corrupting adjacent stack memory
+      // (very likely `cmd` itself, a stack-local holding a std::vector<uint8_t> whose
+      // heap-owning fields sit right next to this array) - confirmed live: the crash
+      // (`heap_caps_free ... free() target pointer is outside heap areas`) matches a
+      // corrupted vector destructor freeing a smashed pointer. Dropping the command
+      // and logging is a safe failure mode; it does NOT make group membership writes
+      // actually work - that needs a real fix (a smaller membership-frame format, or
+      // BLE5 extended advertising) that hasn't been attempted here.
+      if (adv_data_len + cmd.data.size() > sizeof(adv_data_raw)) {
+        ESP_LOGE(TAG, "Command payload (%zu bytes) does not fit in a legacy BLE "
+                      "advertisement (need %u, max %zu) - dropping command instead of "
+                      "corrupting memory. See fastcon_controller.cpp's own comment here.",
+                 cmd.data.size(), (unsigned) (adv_data_len + cmd.data.size()), sizeof(adv_data_raw));
+        return;
+      }
       memcpy(&adv_data_raw[adv_data_len], cmd.data.data(), cmd.data.size());
       adv_data_len += cmd.data.size();
 
@@ -116,7 +142,12 @@ void FastconController::loop() {
 
 // --- helpers for channel resolution ---
 static inline uint8_t to8(float v) {
-  if (v < 0.0f) v = 0.0f; if (v > 1.0f) v = 1.0f; return static_cast<uint8_t>(v * 255.0f + 0.5f);
+  if (v < 0.0f) 
+      v = 0.0f; 
+  if (v > 1.0f) 
+      v = 1.0f; 
+
+  return static_cast<uint8_t>(v * 255.0f + 0.5f);
 }
 
 static inline bool all_zero(float r, float g, float b, float cw, float ww) {
@@ -222,8 +253,13 @@ std::vector<uint8_t> FastconController::group_control(uint8_t group_id, const st
 }
 
 std::vector<uint8_t> FastconController::set_group_members(uint8_t group_id, const std::vector<uint8_t> &mask) {
-  // The app pads this frame to 18 bytes rather than the 12 used by control frames.
-  const size_t frame_len = std::max<size_t>(18, 5 + mask.size());
+  // 12 bytes, the same as every control frame. The app's logger prints an 18-byte buffer
+  // for this frame, but only 12 bytes of it go on the wire: its own captures report
+  // len:24 for membership writes, identical to control frames, and prepare_payload()
+  // yields 24 only from a 12-byte inner payload (8 + 4 header + 12). Padding to 18 here
+  // produced a 30-byte payload, which overflows the 31-byte legacy advertisement.
+  // 12 bytes still leaves room for a 7-byte mask, i.e. 56 lights.
+  const size_t frame_len = std::max<size_t>(12, 5 + mask.size());
   std::vector<uint8_t> result_data(frame_len, 0);
 
   // The length nibble is 4 on every observed frame; the member mask sits outside it.
