@@ -61,6 +61,15 @@ CONFIG_SCHEMA = cv.Schema(
         cv.Optional(
             CONF_MAX_QUEUE_SIZE, default=DEFAULT_MAX_QUEUE_SIZE
         ): cv.positive_int,
+        cv.Optional(
+            CONF_MEMBERSHIP_RETRIES, default=DEFAULT_MEMBERSHIP_RETRIES
+        ): cv.int_range(min=1, max=10),
+        cv.Optional(
+            CONF_MEMBERSHIP_TTL, default=DEFAULT_MEMBERSHIP_TTL
+        ): cv.positive_time_period_milliseconds,
+        cv.Optional(CONF_GROUP_SLOT, default=DEFAULT_GROUP_SLOT): cv.int_range(
+            min=1, max=255
+        ),
     }
 ).extend(cv.COMPONENT_SCHEMA)
 
