@@ -1,6 +1,7 @@
 #pragma once
 
 #include <queue>
+#include <map>
 #include <mutex>
 #include <vector>
 #include "esphome/core/component.h"
@@ -22,6 +23,11 @@ namespace esphome
             std::vector<uint8_t> get_light_data(light::LightState *state);
             std::vector<uint8_t> get_white_light_data(light::LightState *state);
             std::vector<uint8_t> single_control(uint32_t addr, const std::vector<uint8_t> &light_data);
+            std::vector<uint8_t> group_control(uint8_t group_id, const std::vector<uint8_t> &light_data);
+            std::vector<uint8_t> set_group_members(uint8_t group_id, const std::vector<uint8_t> &mask);
+
+            /// Write the membership of `group_id` unless the mesh already holds it and it is fresh.
+            void ensure_group(uint8_t group_id, const std::vector<uint8_t> &mask);
 
             void queueCommand(uint32_t light_id_, const std::vector<uint8_t> &data);
 
@@ -37,6 +43,12 @@ namespace esphome
                 return queue_.size();
             }
             void set_max_queue_size(size_t size) { max_queue_size_ = size; }
+            void set_membership_retries(uint8_t n) { membership_retries_ = n; }
+            void set_membership_ttl(uint32_t ms) { membership_ttl_ = ms; }
+            void set_group_slot(uint8_t id) { group_slot_ = id; }
+
+            /// The group id used by entities that do not pin one of their own.
+            uint8_t get_group_slot() const { return group_slot_; }
 
             void set_mesh_key(std::array<uint8_t, 4> key) { mesh_key_ = key; }
             void set_adv_interval_min(uint16_t val) { adv_interval_min_ = val; }
@@ -77,6 +89,18 @@ namespace esphome
             // Protocol implementation
             std::vector<uint8_t> generate_command(uint8_t n, uint32_t light_id_, const std::vector<uint8_t> &data, bool forward = true);
 
+            struct GroupState
+            {
+                std::vector<uint8_t> mask;
+                uint32_t written_at;
+            };
+
+            /// What we last wrote to each group id, so a repeat costs no frames until it ages out.
+            std::map<uint8_t, GroupState> group_masks_;
+            uint8_t membership_retries_{3};
+            uint32_t membership_ttl_{30000};
+            uint8_t group_slot_{0xfd};
+
             std::array<uint8_t, 4> mesh_key_{};
 
             uint16_t adv_interval_min_{0x20};
@@ -85,6 +109,8 @@ namespace esphome
             uint16_t adv_gap_{10};
 
             static const uint16_t MANUFACTURER_DATA_ID = 0xfff0;
+            static const uint8_t GROUP_MARKER_HI = 0x2a;
+            static const uint8_t GROUP_MARKER_LO = 0xa8;
         };
 
     } // namespace fastcon

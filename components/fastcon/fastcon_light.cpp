@@ -37,11 +37,18 @@ light::LightTraits FastconLight::get_traits() {
   return t;
 }
 
+uint8_t FastconLight::group_addr_() const {
+  return this->mode_ == FASTCON_SHARED_GROUP ? this->controller_->get_group_slot() : this->light_id_;
+}
+
 void FastconLight::write_state(light::LightState *state) {
   if (this->controller_ == nullptr) {
     ESP_LOGW(TAG, "No controller bound; dropping command");
     return;
   }
+
+  const bool is_group = this->mode_ != FASTCON_SINGLE;
+  const unsigned addr = is_group ? (unsigned) this->group_addr_() : (unsigned) this->light_id_;
 
   std::vector<uint8_t> light_bytes;
   auto &values = state->current_values;
@@ -50,21 +57,29 @@ void FastconLight::write_state(light::LightState *state) {
   bool is_white_only = values.get_color_mode() == light::ColorMode::WHITE;
 
   if (is_white_only) {
-    ESP_LOGD(TAG, "Sending white-only command for light %u", (unsigned)this->light_id_);
+    ESP_LOGD(TAG, "Sending white-only command for %s %u", is_group ? "group" : "light", addr);
     light_bytes = this->controller_->get_white_light_data(state);
   } else {
-    ESP_LOGD(TAG, "Sending RGB/color command for light %u", (unsigned)this->light_id_);
+    ESP_LOGD(TAG, "Sending RGB/color command for %s %u", is_group ? "group" : "light", addr);
     light_bytes = this->controller_->get_light_data(state);
   }
 
-  // Wrap into inner payload for this light_id
-  std::vector<uint8_t> payload = this->controller_->single_control(this->light_id_, light_bytes);
+  // Wrap into the inner payload for this address
+  std::vector<uint8_t> payload;
+  if (is_group) {
+    // Claim the slot before addressing it. No-ops while the mesh already holds this
+    // membership, so a repeated command costs one frame instead of four.
+    this->controller_->ensure_group((uint8_t) addr, this->members_);
+    payload = this->controller_->group_control((uint8_t) addr, light_bytes);
+  } else {
+    payload = this->controller_->single_control(this->light_id_, light_bytes);
+  }
 
   // Queue it for advertisement
-  this->controller_->queueCommand(this->light_id_, payload);
+  this->controller_->queueCommand(addr, payload);
 
-  ESP_LOGD(TAG, "Queued state v%s: light_id=%u, payload_len=%d",
-           FASTCON_VERSION, (unsigned)this->light_id_, (int)payload.size());
+  ESP_LOGD(TAG, "Queued state v%s: %s=%u, payload_len=%d",
+           FASTCON_VERSION, is_group ? "group" : "light_id", addr, (int)payload.size());
 }
 
 }  // namespace fastcon

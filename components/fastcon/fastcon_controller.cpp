@@ -1,6 +1,8 @@
 
 #include "esphome/core/component_iterator.h"
 #include "esphome/core/log.h"
+#include "esphome/core/helpers.h"
+#include <algorithm>
 #include "esphome/components/light/color_mode.h"
 #include "esphome/components/light/light_state.h"
 #include "fastcon_controller.h"
@@ -201,6 +203,68 @@ std::vector<uint8_t> FastconController::single_control(uint32_t light_id_, const
            FASTCON_VERSION, result_data.size(), hex.c_str());
 
   return this->generate_command(5, light_id_, result_data, true);
+}
+
+std::vector<uint8_t> FastconController::group_control(uint8_t group_id, const std::vector<uint8_t> &light_data) {
+  std::vector<uint8_t> result_data(12);
+  result_data[0] = 3 | (((0x0FFFFFF & (light_data.size() + 3)) << 4));
+  result_data[1] = GROUP_MARKER_HI;
+  result_data[2] = GROUP_MARKER_LO;
+  result_data[3] = group_id;
+  std::copy(light_data.begin(), light_data.end(), result_data.begin() + 4);
+
+  const auto hex_vec = vector_to_hex_string(result_data);
+  const std::string hex(hex_vec.begin(), hex_vec.end());
+  ESP_LOGD(TAG, "Group Payload v%s (%zu bytes): %s",
+           FASTCON_VERSION, result_data.size(), hex.c_str());
+
+  return this->generate_command(5, 0, result_data, true);
+}
+
+std::vector<uint8_t> FastconController::set_group_members(uint8_t group_id, const std::vector<uint8_t> &mask) {
+  // The app pads this frame to 18 bytes rather than the 12 used by control frames.
+  const size_t frame_len = std::max<size_t>(18, 5 + mask.size());
+  std::vector<uint8_t> result_data(frame_len, 0);
+
+  // The length nibble is 4 on every observed frame; the member mask sits outside it.
+  result_data[0] = 5 | (4 << 4);
+  result_data[1] = group_id;
+
+  // Nonce. Fresh per write - the app never repeats one, so treat it as a replay guard.
+  const uint32_t nonce = random_uint32();
+  result_data[2] = 1 + ((nonce >> 16) % 3);  // observed range 0x01-0x03
+  result_data[3] = (nonce >> 8) & 0xff;
+  result_data[4] = nonce & 0xff;
+
+  std::copy(mask.begin(), mask.end(), result_data.begin() + 5);
+
+  const auto hex_vec = vector_to_hex_string(result_data);
+  const std::string hex(hex_vec.begin(), hex_vec.end());
+  ESP_LOGD(TAG, "Membership Payload v%s (%zu bytes): %s",
+           FASTCON_VERSION, result_data.size(), hex.c_str());
+
+  return this->generate_command(5, 0, result_data, true);
+}
+
+void FastconController::ensure_group(uint8_t group_id, const std::vector<uint8_t> &mask) {
+  if (mask.empty())
+    return;  // group is managed elsewhere (id 0, or defined in the app)
+
+  const uint32_t now = millis();
+  auto it = this->group_masks_.find(group_id);
+  if (it != this->group_masks_.end() && it->second.mask == mask &&
+      this->membership_ttl_ != 0 && (now - it->second.written_at) < this->membership_ttl_)
+    return;  // still ours and still fresh - no frames needed
+
+  ESP_LOGD(TAG, "Defining group %u (%zu mask byte(s))", (unsigned) group_id, mask.size());
+
+  // Lights self-select from this broadcast, and a miss silently drops a light from the
+  // group, so repeat it the way the app does.
+  auto adv_data = this->set_group_members(group_id, mask);
+  for (uint8_t i = 0; i < this->membership_retries_; i++)
+    this->queueCommand(group_id, adv_data);
+
+  this->group_masks_[group_id] = GroupState{mask, now};
 }
 
 std::vector<uint8_t> FastconController::generate_command(uint8_t n, uint32_t light_id_, const std::vector<uint8_t> &data, bool forward) {

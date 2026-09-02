@@ -11,12 +11,21 @@ CONF_ADV_INTERVAL_MAX = "adv_interval_max"
 CONF_ADV_DURATION = "adv_duration"
 CONF_ADV_GAP = "adv_gap"
 CONF_MAX_QUEUE_SIZE = "max_queue_size"
+CONF_MEMBERSHIP_RETRIES = "membership_retries"
+CONF_MEMBERSHIP_TTL = "membership_ttl"
+CONF_GROUP_SLOT = "group_slot"
 
 DEFAULT_ADV_INTERVAL_MIN = 0x20
 DEFAULT_ADV_INTERVAL_MAX = 0x40
 DEFAULT_ADV_DURATION = 50
 DEFAULT_ADV_GAP = 10
 DEFAULT_MAX_QUEUE_SIZE = 100
+DEFAULT_MEMBERSHIP_RETRIES = 3
+DEFAULT_MEMBERSHIP_TTL = "30s"
+
+# The id the BRMesh app itself uses for ad-hoc multi-selections. Proven to work on real
+# hardware, which an id the app never issues is not.
+DEFAULT_GROUP_SLOT = 0xFD
 
 
 def validate_hex_bytes(value):
@@ -76,3 +85,6 @@ async def to_code(config):
     cg.add(var.set_adv_duration(config[CONF_ADV_DURATION]))
     cg.add(var.set_adv_gap(config[CONF_ADV_GAP]))
     cg.add(var.set_max_queue_size(config[CONF_MAX_QUEUE_SIZE]))
+    cg.add(var.set_membership_retries(config[CONF_MEMBERSHIP_RETRIES]))
+    cg.add(var.set_membership_ttl(config[CONF_MEMBERSHIP_TTL]))
+    cg.add(var.set_group_slot(config[CONF_GROUP_SLOT]))
