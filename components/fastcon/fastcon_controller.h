@@ -87,7 +87,8 @@ namespace esphome
             uint32_t state_start_time_{0};
 
             // Protocol implementation
-            std::vector<uint8_t> generate_command(uint8_t n, uint32_t light_id_, const std::vector<uint8_t> &data, bool forward = true);
+            std::vector<uint8_t> generate_command(uint8_t n, uint32_t light_id_, const std::vector<uint8_t> &data, bool forward = true,
+                                                    bool membership_framing = false);
 
             struct GroupState
             {

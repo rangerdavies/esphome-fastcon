@@ -56,5 +56,22 @@ namespace esphome
             // Return only the portion after 0xf bytes
             return std::vector<uint8_t>(payload.begin() + 0xf, payload.end());
         }
+
+        std::vector<uint8_t> prepare_membership_payload(const std::vector<uint8_t> &body)
+        {
+            // Whitening's keystream depends only on position (0x25 seed), never on the data
+            // being whitened - so the discarded first 15 bytes can be anything. Only the
+            // marker + body portion, starting at position 0xf, ends up on the wire.
+            std::vector<uint8_t> buf(0xf, 0);
+            buf.push_back(0xa5);
+            buf.push_back(0x5a);
+            buf.insert(buf.end(), body.begin(), body.end());
+
+            WhiteningContext context;
+            whitening_init(0x25, context);
+            whitening_encode(buf, context);
+
+            return std::vector<uint8_t>(buf.begin() + 0xf, buf.end());
+        }
     } // namespace fastcon
 } // namespace esphome

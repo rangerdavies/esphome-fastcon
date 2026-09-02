@@ -175,3 +175,6 @@ cython_debug/
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 secrets.yaml
+
+# Visual Studio open-folder cache
+.vs/

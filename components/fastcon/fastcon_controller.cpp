@@ -84,18 +84,19 @@ void FastconController::loop() {
       adv_data_raw[adv_data_len++] = (MANUFACTURER_DATA_ID >> 8) & 0xFF;
 
       // Bounds check - legacy BLE advertising is capped at 31 bytes total, and
-      // adv_data_raw is sized to match. Control frames (24 bytes) fit; membership-write
-      // frames (set_group_members(), padded to 18 bytes -> 30 bytes after
-      // generate_command()/prepare_payload() framing) do NOT - adv_data_len + 30 = 37,
-      // 6 bytes past the end of a 31-byte stack array. The old code had no check here
-      // and silently ran memcpy() past the buffer, corrupting adjacent stack memory
-      // (very likely `cmd` itself, a stack-local holding a std::vector<uint8_t> whose
-      // heap-owning fields sit right next to this array) - confirmed live: the crash
-      // (`heap_caps_free ... free() target pointer is outside heap areas`) matches a
-      // corrupted vector destructor freeing a smashed pointer. Dropping the command
-      // and logging is a safe failure mode; it does NOT make group membership writes
-      // actually work - that needs a real fix (a smaller membership-frame format, or
-      // BLE5 extended advertising) that hasn't been attempted here.
+      // adv_data_raw is sized to match. All command types (control frames and, since
+      // set_group_members() moved to prepare_membership_payload()'s framing, membership
+      // writes too) land on exactly 24 wire bytes, so adv_data_len + 24 = 31 fits exactly.
+      // This check is defense in depth against a future command type or a wider mask
+      // (mask.size() > 1, never confirmed on hardware) growing past that budget - it was
+      // added after an earlier bug (a membership frame that really did land at 30 bytes,
+      // via the wrong wire framing) had no check here and silently ran memcpy() past the
+      // buffer, corrupting adjacent stack memory (very likely `cmd` itself, a stack-local
+      // holding a std::vector<uint8_t> whose heap-owning fields sit right next to this
+      // array) - confirmed live: the crash (`heap_caps_free ... free() target pointer is
+      // outside heap areas`) matched a corrupted vector destructor freeing a smashed
+      // pointer. Dropping the command and logging is the safe failure mode if this is
+      // ever hit again.
       if (adv_data_len + cmd.data.size() > sizeof(adv_data_raw)) {
         ESP_LOGE(TAG, "Command payload (%zu bytes) does not fit in a legacy BLE "
                       "advertisement (need %u, max %zu) - dropping command instead of "
@@ -253,13 +254,16 @@ std::vector<uint8_t> FastconController::group_control(uint8_t group_id, const st
 }
 
 std::vector<uint8_t> FastconController::set_group_members(uint8_t group_id, const std::vector<uint8_t> &mask) {
-  // 12 bytes, the same as every control frame. The app's logger prints an 18-byte buffer
-  // for this frame, but only 12 bytes of it go on the wire: its own captures report
-  // len:24 for membership writes, identical to control frames, and prepare_payload()
-  // yields 24 only from a 12-byte inner payload (8 + 4 header + 12). Padding to 18 here
-  // produced a 30-byte payload, which overflows the 31-byte legacy advertisement.
-  // 12 bytes still leaves room for a 7-byte mask, i.e. 56 lights.
-  const size_t frame_len = std::max<size_t>(12, 5 + mask.size());
+  // 18 bytes, matching the app's own logged inner payload exactly - confirmed against real
+  // BRMesh captures (two live "getPayloadWithInnerRetry"/"send--->"/"calculatedPayload"
+  // triples, different masks/nonces, both reproduced byte-for-byte). The apparent 31-byte
+  // overflow a previous fix here worked around by truncating to 12 bytes was real, but the
+  // truncation was the wrong fix: this frame type was never going through the standard
+  // address+CRC wire framing that overflowed. It uses a different envelope entirely - see
+  // prepare_membership_payload() in protocol.cpp - which lands at 24 wire bytes regardless,
+  // the same as every other command. 18 bytes still leaves room for a 13-byte mask, i.e.
+  // 104 lights.
+  const size_t frame_len = std::max<size_t>(18, 5 + mask.size());
   std::vector<uint8_t> result_data(frame_len, 0);
 
   // The length nibble is 4 on every observed frame; the member mask sits outside it.
@@ -279,7 +283,7 @@ std::vector<uint8_t> FastconController::set_group_members(uint8_t group_id, cons
   ESP_LOGD(TAG, "Membership Payload v%s (%zu bytes): %s",
            FASTCON_VERSION, result_data.size(), hex.c_str());
 
-  return this->generate_command(5, 0, result_data, true);
+  return this->generate_command(5, 0, result_data, true, /*membership_framing=*/true);
 }
 
 void FastconController::ensure_group(uint8_t group_id, const std::vector<uint8_t> &mask) {
@@ -303,7 +307,8 @@ void FastconController::ensure_group(uint8_t group_id, const std::vector<uint8_t
   this->group_masks_[group_id] = GroupState{mask, now};
 }
 
-std::vector<uint8_t> FastconController::generate_command(uint8_t n, uint32_t light_id_, const std::vector<uint8_t> &data, bool forward) {
+std::vector<uint8_t> FastconController::generate_command(uint8_t n, uint32_t light_id_, const std::vector<uint8_t> &data, bool forward,
+                                                            bool membership_framing) {
   static uint8_t sequence = 0;
 
   // Create command body with header
@@ -335,6 +340,9 @@ std::vector<uint8_t> FastconController::generate_command(uint8_t n, uint32_t lig
   }
 
   // RF protocol formatting
+  if (membership_framing)
+    return prepare_membership_payload(body);
+
   std::vector<uint8_t> addr = {DEFAULT_BLE_FASTCON_ADDRESS.begin(), DEFAULT_BLE_FASTCON_ADDRESS.end()};
   return prepare_payload(addr, body);
 }
