@@ -255,6 +255,7 @@ std::vector<uint8_t> FastconController::single_control(uint32_t light_id_, const
   ESP_LOGD(TAG, "Inner Payload v%s (%zu bytes): %s",
            FASTCON_VERSION, result_data.size(), hex.c_str());
 
+  this->note_sent_(result_data);
   return this->generate_command(5, light_id_, result_data, true);
 }
 
@@ -271,6 +272,7 @@ std::vector<uint8_t> FastconController::group_control(uint8_t group_id, const st
   ESP_LOGD(TAG, "Group Payload v%s (%zu bytes): %s",
            FASTCON_VERSION, result_data.size(), hex.c_str());
 
+  this->note_sent_(result_data);
   return this->generate_command(5, 0, result_data, true);
 }
 
@@ -304,6 +306,7 @@ std::vector<uint8_t> FastconController::set_group_members(uint8_t group_id, cons
   ESP_LOGD(TAG, "Membership Payload v%s (%zu bytes): %s",
            FASTCON_VERSION, result_data.size(), hex.c_str());
 
+  this->note_sent_(result_data);
   return this->generate_command(5, 0, result_data, true, /*membership_framing=*/true);
 }
 
@@ -608,9 +611,36 @@ void FastconController::handle_sniffed_payload_(const std::vector<uint8_t> &payl
   this->dispatch_observed_(inner);
 }
 
+void FastconController::note_sent_(const std::vector<uint8_t> &inner) {
+  const uint32_t now = millis();
+  this->recent_sent_.push_back(SentFrame{inner, now});
+  while (this->recent_sent_.size() > SENT_ECHO_MAX ||
+         (!this->recent_sent_.empty() && now - this->recent_sent_.front().at > SENT_ECHO_WINDOW_MS))
+    this->recent_sent_.pop_front();
+}
+
+bool FastconController::was_sent_by_us_(const std::vector<uint8_t> &inner) {
+  const uint32_t now = millis();
+  for (auto it = this->recent_sent_.begin(); it != this->recent_sent_.end(); ++it) {
+    if (now - it->at <= SENT_ECHO_WINDOW_MS && it->inner == inner)
+      return true;
+  }
+  return false;
+}
+
 void FastconController::dispatch_observed_(const std::vector<uint8_t> &inner) {
   if (inner.empty())
     return;
+
+  // The bulbs relay. Every frame this controller sends comes back off six different BLE
+  // addresses, one per bulb, for a second or two afterwards. Publishing our own command
+  // back onto the entity makes ESPHome re-encode it - and the round trip through its
+  // colour model is not lossless, so it lands a step away, transmits, gets relayed, and
+  // walks brightness and colour temperature down a rounding staircase. Drop our own.
+  if (this->was_sent_by_us_(inner)) {
+    ESP_LOGV(TAG, "SNIFF skip our own transmission");
+    return;
+  }
 
   const uint8_t cmd = inner[0] & 0x0f;
   const size_t declared = (inner[0] >> 4) & 0x0f;  // count of bytes following inner[0]

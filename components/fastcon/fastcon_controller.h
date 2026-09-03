@@ -1,6 +1,7 @@
 #pragma once
 
 #include <queue>
+#include <deque>
 #include <map>
 #include <mutex>
 #include <vector>
@@ -152,6 +153,24 @@ namespace esphome
             /// it. Silently drops anything that is not a well-formed frame for our mesh.
             void handle_sniffed_payload_(const std::vector<uint8_t> &payload);
             void dispatch_observed_(const std::vector<uint8_t> &inner);
+
+            /// Remember an inner payload we are about to transmit. The bulbs RELAY every
+            /// frame (confirmed live 2026-09-03: six distinct BLE addresses, one per bulb,
+            /// rebroadcast each command), so the sniffer hears everything this controller
+            /// sends. Without this the decode publishes our own command straight back onto
+            /// the entity, which re-encodes it a rounding step away from where it started and
+            /// transmits again - a loop that walks brightness and colour temperature down.
+            void note_sent_(const std::vector<uint8_t> &inner);
+            bool was_sent_by_us_(const std::vector<uint8_t> &inner);
+
+            struct SentFrame
+            {
+                std::vector<uint8_t> inner;
+                uint32_t at;
+            };
+            std::deque<SentFrame> recent_sent_;
+            static const uint32_t SENT_ECHO_WINDOW_MS = 5000;
+            static const size_t SENT_ECHO_MAX = 48;
 
             bool sniffer_enabled_{false};
             std::vector<FastconLight *> lights_;

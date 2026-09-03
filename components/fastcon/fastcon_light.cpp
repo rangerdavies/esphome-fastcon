@@ -1,4 +1,5 @@
 
+#include <algorithm>
 #include "esphome/core/log.h"
 #include "esphome/components/light/light_state.h"
 #include "fastcon_controller.h"
@@ -107,7 +108,13 @@ void FastconLight::apply_observed(bool is_group, uint8_t addr, const std::vector
         // Inverse of get_light_data()'s encoding: byte 4 is warm white, byte 5 cold,
         // and the pair spans 153-500 mireds linearly.
         call.set_color_mode_if_supported(light::ColorMode::COLD_WARM_WHITE);
-        call.set_color_temperature(153.0f + (500.0f - 153.0f) * ww / (float) (ww + cw));
+        // Clamp to the traits range. Floating point puts the ww==0 case a hair under
+        // 153, which ESPHome rejects with "Color temperature value 153.00 is out of
+        // range [153.0 - 500.0]" - a warning whose numbers look identical because the
+        // log rounds what the comparison does not.
+        float mireds = 153.0f + (500.0f - 153.0f) * ww / (float) (ww + cw);
+        mireds = std::max(153.0f, std::min(500.0f, mireds));
+        call.set_color_temperature(mireds);
       }
     }
   }
