@@ -498,6 +498,19 @@ int FastconController::observed_group_of(uint8_t light_id) const {
   return it == this->observed_light_group_.end() ? -1 : (int) it->second;
 }
 
+/// Local hex formatter - vector_to_hex_string() takes a non-const reference, which is
+/// awkward for the read-only buffers all over the sniffer path.
+static std::string sniff_hex(const std::vector<uint8_t> &v) {
+  static const char *const H = "0123456789abcdef";
+  std::string s;
+  s.reserve(v.size() * 2);
+  for (uint8_t b : v) {
+    s.push_back(H[b >> 4]);
+    s.push_back(H[b & 0x0f]);
+  }
+  return s;
+}
+
 #ifdef USE_ESP32_BLE_TRACKER
 bool FastconController::parse_device(const esp32_ble_tracker::ESPBTDevice &device) {
   if (!this->sniffer_enabled_)
@@ -508,6 +521,12 @@ bool FastconController::parse_device(const esp32_ble_tracker::ESPBTDevice &devic
       continue;
     if (md.uuid.get_uuid().uuid.uuid16 != MANUFACTURER_DATA_ID)
       continue;
+
+    // Raw, before anything is done to it. This is the exact equivalent of the app's own
+    // `calculatedPayload` line, so a capture from here can be decoded the same way.
+    ESP_LOGD(TAG, "SNIFF raw  from=%s rssi=%d len=%u wire=%s", device.address_str().c_str(),
+             device.get_rssi(), (unsigned) md.data.size(), sniff_hex(md.data).c_str());
+
     this->handle_sniffed_payload_(md.data);
   }
   return false;  // never claim the device - bluetooth_proxy still wants to see it
@@ -525,39 +544,65 @@ void FastconController::handle_sniffed_payload_(const std::vector<uint8_t> &payl
   whitening_encode(buf, ctx);
   std::vector<uint8_t> pre(buf.begin() + 0xf, buf.end());
 
+  // Un-whitened but still wrapped and still encrypted. Equivalent to nothing the app
+  // logs directly, but it is where framing is decided, so log it before deciding.
+  ESP_LOGD(TAG, "SNIFF pre  %s", sniff_hex(pre).c_str());
+
   std::vector<uint8_t> body;
+  const char *framing;
   if (pre.size() >= 8 && pre[0] == 0xa5 && pre[1] == 0x5a) {
     // Membership framing: marker then body, no address and no CRC.
     body.assign(pre.begin() + 2, pre.end());
+    framing = "membership";
   } else if (pre.size() >= 12 && pre[0] == 0x8e && pre[1] == 0xf0 && pre[2] == 0xaa) {
     // Control framing. 0x8e/0xf0/0xaa are reverse_8() of 0x71/0x0f/0x55; three address
     // bytes follow it and a CRC16 trails.
     body.assign(pre.begin() + 6, pre.end() - 2);
+    framing = "control";
   } else {
-    return;  // not a fastcon frame
+    ESP_LOGD(TAG, "SNIFF drop no framing marker (want a55a or 8ef0aa, got %02x%02x%02x, len %u)",
+             pre.size() > 0 ? pre[0] : 0, pre.size() > 1 ? pre[1] : 0, pre.size() > 2 ? pre[2] : 0,
+             (unsigned) pre.size());
+    return;
   }
 
-  if (body.size() < 5)
+  if (body.size() < 5) {
+    ESP_LOGD(TAG, "SNIFF drop %s body too short (%u bytes)", framing, (unsigned) body.size());
     return;
+  }
 
   for (size_t i = 0; i < 4; i++)
     body[i] ^= DEFAULT_ENCRYPT_KEY[i & 3];
   for (size_t i = 4; i < body.size(); i++)
     body[i] ^= this->mesh_key_[(i - 4) & 3];
 
+  // Equivalent to the app's `send--->` line once decrypted: header then inner payload.
+  ESP_LOGD(TAG, "SNIFF body %s framing=%s", sniff_hex(body).c_str(), framing);
+
   // Two independent checks that this decoded cleanly and belongs to our mesh. A frame
   // from a neighbour's mesh decrypts to noise and fails both.
-  if (body[2] != this->mesh_key_[3])
+  if (body[2] != this->mesh_key_[3]) {
+    ESP_LOGD(TAG, "SNIFF drop mesh key mismatch (body[2]=%02x, ours=%02x)", body[2],
+             this->mesh_key_[3]);
     return;
+  }
   uint8_t sum = 0;
   for (size_t i = 0; i < body.size(); i++) {
     if (i != 3)
       sum += body[i];
   }
-  if (sum != body[3])
+  if (sum != body[3]) {
+    ESP_LOGD(TAG, "SNIFF drop checksum %02x != %02x", sum, body[3]);
     return;
+  }
 
-  this->dispatch_observed_(std::vector<uint8_t>(body.begin() + 4, body.end()));
+  const std::vector<uint8_t> inner(body.begin() + 4, body.end());
+  // Equivalent to the app's `getPayloadWithInnerRetry---> payload:` line.
+  ESP_LOGD(TAG, "SNIFF inner %s  n=%u seq=%u fwd=%u", sniff_hex(inner).c_str(),
+           (unsigned) ((body[0] >> 4) & 7), (unsigned) body[1],
+           (unsigned) ((body[0] & 0x80) ? 1 : 0));
+
+  this->dispatch_observed_(inner);
 }
 
 void FastconController::dispatch_observed_(const std::vector<uint8_t> &inner) {
