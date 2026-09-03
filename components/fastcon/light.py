@@ -16,6 +16,7 @@ AUTO_LOAD = ["light"]
 CONF_CONTROLLER_ID = "controller_id"
 CONF_GROUP_ID = "group_id"
 CONF_DYNAMIC_GROUP = "dynamic_group"
+CONF_GROUP_NAME = "group_name"
 
 # Only the fastcon.set_members action key. Membership is no longer declarable on the
 # entity itself - it comes from Home Assistant at runtime.
@@ -83,9 +84,15 @@ SetMembersAction = fastcon_ns.class_("SetMembersAction", automation.Action)
     SetMembersAction,
     cv.Schema(
         {
-            cv.Required(CONF_ID): cv.use_id(FastconLight),
+            cv.Required(CONF_GROUP_NAME): cv.use_id(FastconLight),
             cv.Required(CONF_MEMBERS): cv.templatable(
                 cv.ensure_list(cv.int_range(min=1, max=MAX_LIGHT_ID))
+            ),
+            # Accepted only so the rename can be reported clearly rather than as an
+            # "extra keys not allowed" error.
+            cv.Optional(CONF_ID): cv.invalid(
+                f"'id' is now '{CONF_GROUP_NAME}' on fastcon.set_members - it names the "
+                f"group entity whose membership is being set"
             ),
         }
     ),
@@ -94,7 +101,7 @@ SetMembersAction = fastcon_ns.class_("SetMembersAction", automation.Action)
     synchronous=True,
 )
 async def set_members_action_to_code(config, action_id, template_arg, args):
-    parent = await cg.get_variable(config[CONF_ID])
+    parent = await cg.get_variable(config[CONF_GROUP_NAME])
     var = cg.new_Pvariable(action_id, template_arg, parent)
     members = await cg.templatable(
         config[CONF_MEMBERS], args, cg.std_vector.template(cg.int32)
