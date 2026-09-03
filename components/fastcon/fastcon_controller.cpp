@@ -485,6 +485,7 @@ void FastconController::send_time_sync() {
 
   // Once, not command_retries_ times: this carries no state worth re-asserting, and it is
   // already queued twice around every group action.
+  this->note_sent_(data);
   this->queueCommand(0, this->generate_command(5, 0, data, true), 1);
 #else
   // No `time:` platform anywhere in this build, so time_id could never have been set
@@ -584,12 +585,27 @@ void FastconController::handle_sniffed_payload_(const std::vector<uint8_t> &payl
   // Whitening XORs against a position-keyed stream and is therefore its own inverse,
   // but that stream starts 0xf bytes before the part which goes on the air. Rebuild the
   // offset so the keystream lines up, then take the padding back off.
-  std::vector<uint8_t> buf(0xf, 0);
-  buf.insert(buf.end(), payload.begin(), payload.end());
-  WhiteningContext ctx;
-  whitening_init(0x25, ctx);
-  whitening_encode(buf, ctx);
-  std::vector<uint8_t> pre(buf.begin() + 0xf, buf.end());
+  // Frames normally arrive whitened, so un-whiten first. But some arrive already plain -
+  // membership frames have been seen on air with the a5 5a marker in the clear, which the
+  // transmit path cannot produce (verified: whitening our own membership payload yields
+  // 461c67..., matching the app's captured wire form). Accept either, by testing for the
+  // plaintext markers before spending the transform on it.
+  const bool already_plain =
+      (payload.size() >= 2 && payload[0] == 0xa5 && payload[1] == 0x5a) ||
+      (payload.size() >= 3 && payload[0] == 0x8e && payload[1] == 0xf0 && payload[2] == 0xaa);
+
+  std::vector<uint8_t> pre;
+  if (already_plain) {
+    pre = payload;
+    ESP_LOGD(TAG, "SNIFF plain (arrived un-whitened)");
+  } else {
+    std::vector<uint8_t> buf(0xf, 0);
+    buf.insert(buf.end(), payload.begin(), payload.end());
+    WhiteningContext ctx;
+    whitening_init(0x25, ctx);
+    whitening_encode(buf, ctx);
+    pre.assign(buf.begin() + 0xf, buf.end());
+  }
 
   // Un-whitened but still wrapped and still encrypted. Equivalent to nothing the app
   // logs directly, but it is where framing is decided, so log it before deciding.
