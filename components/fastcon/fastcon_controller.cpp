@@ -524,7 +524,10 @@ bool FastconController::parse_device(const esp32_ble_tracker::ESPBTDevice &devic
 
     // Raw, before anything is done to it. This is the exact equivalent of the app's own
     // `calculatedPayload` line, so a capture from here can be decoded the same way.
-    ESP_LOGD(TAG, "SNIFF raw  from=%s rssi=%d len=%u wire=%s", device.address_str().c_str(),
+    // address_str() is deprecated (removed in ESPHome 2027.2.0) in favour of writing
+    // into a caller-supplied buffer.
+    char addr_buf[esp32_ble_tracker::ESPBTDevice::MAC_ADDRESS_PRETTY_BUFFER_SIZE];
+    ESP_LOGD(TAG, "SNIFF raw  from=%s rssi=%d len=%u wire=%s", device.address_str_to(addr_buf),
              device.get_rssi(), (unsigned) md.data.size(), sniff_hex(md.data).c_str());
 
     this->handle_sniffed_payload_(md.data);
