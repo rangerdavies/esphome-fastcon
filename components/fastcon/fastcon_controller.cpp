@@ -309,12 +309,25 @@ void FastconController::ensure_group(uint8_t group_id, const std::vector<uint8_t
   if (mask.empty())
     return;  // group is managed elsewhere (id 0, or defined in the app)
 
-  const uint32_t now = millis();
-  auto it = this->group_masks_.find(group_id);
-  if (it != this->group_masks_.end() && it->second.mask == mask &&
-      this->membership_ttl_ != 0 && (now - it->second.written_at) < this->membership_ttl_)
-    return;  // still ours and still fresh - no frames needed
-
+  // Always rewrite membership (2026-09-03, per direct confirmation of real hardware
+  // behavior: "the lights only hold 1 group assignment, anytime a group is commanded the
+  // membership must be rewritten"). This used to skip the write whenever group_masks_
+  // already held the same mask for this group_id within membership_ttl_, on the assumption
+  // a bulb remembers membership in several different groups at once and only needs
+  // reminding once that record goes stale. False on this hardware: each bulb has exactly
+  // one group slot, so ANY other group_id's membership write that happens to include this
+  // same bulb silently evicts it from this group - with no ack in this protocol, this
+  // controller has no way to detect that eviction, and the old group_masks_ freshness check
+  // had no way to know a different group_id had since claimed the same bulb. Confirmed live
+  // 2026-09-03: Day Light's group 23 (lights 2/4/6, shared with TV Low's groups 20/21 and
+  // Evening's shared group_slot) failed to turn off on a repeat dispatch that skipped
+  // re-defining membership (still "fresh" under the old membership_ttl_ window) - almost
+  // certainly because an intervening command to one of those other group_ids had already
+  // reclaimed one or more of the same bulbs. membership_ttl_ and the group_masks_ freshness
+  // check are consequently unused now (the config option/setter are kept for backward YAML
+  // compatibility - see fastcon_controller.py) - every call now pays the full
+  // membership-write-plus-retries cost, matching what real captured app traffic already
+  // suggested (it never assumes a bulb remembers a prior group either).
   ESP_LOGD(TAG, "Defining group %u (%zu mask byte(s))", (unsigned) group_id, mask.size());
 
   // Lights self-select from this broadcast, and a miss silently drops a light from the
@@ -323,7 +336,7 @@ void FastconController::ensure_group(uint8_t group_id, const std::vector<uint8_t
   for (uint8_t i = 0; i < this->membership_retries_; i++)
     this->queueCommand(group_id, adv_data);
 
-  this->group_masks_[group_id] = GroupState{mask, now};
+  this->group_masks_[group_id] = GroupState{mask, millis()};
 }
 
 // Dynamic groups (2026-09-02 night): brightness arrives already on the 0-127 wire scale and

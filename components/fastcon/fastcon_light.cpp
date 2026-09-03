@@ -107,8 +107,11 @@ void FastconLight::write_state(light::LightState *state) {
     // if no time_id is configured on the controller.
     this->controller_->send_time_sync();
 
-    // Claim the slot before addressing it. No-ops while the mesh already holds this
-    // membership, so a repeated command costs one frame instead of four.
+    // Claim the slot before addressing it - unconditionally, every call (2026-09-03: these
+    // bulbs hold exactly one group assignment each, so a bulb shared with any OTHER group_id
+    // this controller has since addressed may already have been silently evicted from this
+    // one; see FastconController::ensure_group()'s own comment for the confirmed-live
+    // incident this fixed).
     this->controller_->ensure_group((uint8_t) addr, this->members_);
     payload = this->controller_->group_control((uint8_t) addr, light_bytes);
   } else {

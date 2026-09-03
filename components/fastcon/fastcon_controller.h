@@ -31,7 +31,13 @@ namespace esphome
             std::vector<uint8_t> group_control(uint8_t group_id, const std::vector<uint8_t> &light_data);
             std::vector<uint8_t> set_group_members(uint8_t group_id, const std::vector<uint8_t> &mask);
 
-            /// Write the membership of `group_id` unless the mesh already holds it and it is fresh.
+            /// Write the membership of `group_id`, unconditionally, every time this is called.
+            /// (2026-09-03 - no longer skips on a "still fresh" cache hit: these bulbs hold
+            /// exactly one group assignment each, so a different group_id's membership write
+            /// silently evicts a shared bulb with no way for this controller to detect it - see
+            /// this method's own .cpp comment for the confirmed-live incident that established
+            /// this.) membership_ttl_/group_masks_'s written_at are no longer read for that
+            /// purpose - group_masks_ is kept only as a last-written record.
             void ensure_group(uint8_t group_id, const std::vector<uint8_t> &mask);
 
             /// Queue a cmd-9 time-sync frame, matching the app's own habit of sending one right
@@ -79,6 +85,10 @@ namespace esphome
             }
             void set_max_queue_size(size_t size) { max_queue_size_ = size; }
             void set_membership_retries(uint8_t n) { membership_retries_ = n; }
+            /// No longer affects behavior (2026-09-03) - ensure_group() rewrites membership
+            /// unconditionally on every call now, see its own header comment. Kept only so the
+            /// `fastcon: membership_ttl:` YAML option (fastcon_controller.py) still compiles for
+            /// anyone with it set.
             void set_membership_ttl(uint32_t ms) { membership_ttl_ = ms; }
             void set_group_slot(uint8_t id) { group_slot_ = id; }
 
@@ -132,10 +142,13 @@ namespace esphome
                 uint32_t written_at;
             };
 
-            /// What we last wrote to each group id, so a repeat costs no frames until it ages out.
+            /// What we last wrote to each group id - kept only as a last-written record
+            /// (2026-09-03: no longer used to skip a rewrite, see ensure_group()'s own
+            /// comment - these bulbs hold one group assignment each, so "we wrote it recently"
+            /// says nothing about whether a DIFFERENT group_id's write has since evicted it).
             std::map<uint8_t, GroupState> group_masks_;
             uint8_t membership_retries_{3};
-            uint32_t membership_ttl_{30000};
+            uint32_t membership_ttl_{30000};  // unused - see set_membership_ttl()'s own comment
             uint8_t group_slot_{0xfd};
 
             std::array<uint8_t, 4> mesh_key_{};
