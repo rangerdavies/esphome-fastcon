@@ -131,9 +131,14 @@ void FastconLight::fill_call_(light::LightCall &call, const std::vector<uint8_t>
 }
 
 void FastconLight::publish_group_state(uint8_t light_id, const std::vector<uint8_t> &ld) {
-  // Only the individual entity for this mesh id: a group entity's own state is set by
-  // the command that produced this, and other lights are not in this group.
-  if (this->mode_ != FASTCON_SINGLE || this->light_id_ != light_id)
+  // Only individual entities: a group entity's own state is set by the command that
+  // produced this.
+  if (this->mode_ != FASTCON_SINGLE)
+    return;
+  // light_id 0 means "every single light on this mesh". Valid mesh ids start at 1, so 0
+  // is free as a sentinel. Used for the hardwired all-lights group, which commands every
+  // bulb whether or not the caller happened to list it.
+  if (light_id != 0 && this->light_id_ != light_id)
     return;
   if (this->light_state_ == nullptr || ld.empty())
     return;

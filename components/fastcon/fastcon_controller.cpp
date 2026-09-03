@@ -447,8 +447,17 @@ void FastconController::dynamic_group_command(uint8_t group_id, const std::vecto
   this->send_time_sync();
 
   // The group frame is on its way; now make the individual entities agree with it, so a
-  // reconciler sees per-light state rather than six lights it believes are unchanged.
-  this->publish_group_members(members, light_data);
+  // reconciler sees per-light state rather than lights it believes are unchanged.
+  //
+  // Group 0 is the hardwired all-lights group: it needs no membership write and it
+  // commands every bulb on the mesh, including any the caller did not list. Publishing
+  // only the listed members would leave the rest showing stale state while physically
+  // having changed - so publish onto every single-light entity instead, via the 0
+  // sentinel. This matters as soon as lights exist that the presets do not enumerate.
+  if (group_id == 0)
+    this->publish_group_members({0}, light_data);
+  else
+    this->publish_group_members(members, light_data);
 
   ESP_LOGD(TAG, "Dynamic group command: group=%u members=%zu state=%d brightness=%u payload_len=%d",
            (unsigned) group_id, members.size(), (int) state, (unsigned) brightness, (int) payload.size());
