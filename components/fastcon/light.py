@@ -59,7 +59,13 @@ CONFIG_SCHEMA = cv.All(
     light.BRIGHTNESS_ONLY_LIGHT_SCHEMA
     .extend(
         {
-            cv.GenerateID(CONF_OUTPUT_ID): cv.declare_id(FastconLight),
+            # Names the platform output. fastcon.set_members takes the same value under
+            # the same key, so a group is referred to by one name everywhere.
+            cv.GenerateID(CONF_GROUP_NAME): cv.declare_id(FastconLight),
+            cv.Optional(CONF_OUTPUT_ID): cv.invalid(
+                f"'output_id' is now '{CONF_GROUP_NAME}' - the same name the "
+                f"fastcon.set_members action uses to refer to this entity"
+            ),
             cv.Optional(CONF_LIGHT_ID): cv.int_range(min=1, max=MAX_LIGHT_ID),
             cv.Optional(CONF_GROUP_ID): cv.int_range(min=0, max=255),
             cv.Optional(CONF_DYNAMIC_GROUP): cv.boolean,
@@ -120,7 +126,7 @@ async def to_code(config):
         # membership until fastcon.set_members gives it one.
         mode, addr = MODE_SHARED_GROUP, 0
 
-    var = cg.new_Pvariable(config[CONF_OUTPUT_ID], addr)
+    var = cg.new_Pvariable(config[CONF_GROUP_NAME], addr)
     cg.add(var.set_mode(mode))
 
     await cg.register_component(var, config)
