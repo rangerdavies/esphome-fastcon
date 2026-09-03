@@ -5,7 +5,12 @@
 #include <algorithm>
 #include "esphome/components/light/color_mode.h"
 #include "esphome/components/light/light_state.h"
+// USE_TIME is only defined (and esphome/components/time/*'s sources only added to the
+// build) when a `time:` platform is actually configured - guard the include, matching
+// core components with an optional time_id (e.g. deep_sleep).
+#ifdef USE_TIME
 #include "esphome/components/time/real_time_clock.h"
+#endif
 #include "fastcon_controller.h"
 #include "protocol.h"
 
@@ -322,6 +327,7 @@ void FastconController::ensure_group(uint8_t group_id, const std::vector<uint8_t
 }
 
 void FastconController::send_time_sync() {
+#ifdef USE_TIME
   if (this->time_source_ == nullptr) {
     ESP_LOGV(TAG, "No time source configured, skipping time-sync frame");
     return;
@@ -354,6 +360,11 @@ void FastconController::send_time_sync() {
            now.minute, now.second);
 
   this->queueCommand(0, this->generate_command(5, 0, data, true));
+#else
+  // No `time:` platform anywhere in this build, so time_id could never have been set
+  // (its schema requires cv.use_id(time.RealTimeClock)) - time_source_ is always null.
+  ESP_LOGV(TAG, "Built without USE_TIME, skipping time-sync frame");
+#endif
 }
 
 std::vector<uint8_t> FastconController::generate_command(uint8_t n, uint32_t light_id_, const std::vector<uint8_t> &data, bool forward,
