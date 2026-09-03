@@ -17,7 +17,7 @@
 #include "utils.h"
 
 #ifndef FASTCON_VERSION
-#define FASTCON_VERSION "0.3.2-dev"
+#define FASTCON_VERSION "0.3.4-dev"
 #endif
 
 namespace esphome {
@@ -227,6 +227,13 @@ static inline bool all_zero(float r, float g, float b, float cw, float ww) {
   return r == 0.0f && g == 0.0f && b == 0.0f && cw == 0.0f && ww == 0.0f;
 }
 
+// Does this color mode carry this channel at all? Same test as LightColorValues::as_rgb()
+// and as_cwww() make before filling their outputs. Spelled with explicit casts rather than
+// `mode & cap` so it does not depend on which operator& overload color_mode.h provides.
+static inline bool has_cap(light::ColorMode mode, light::ColorCapability cap) {
+  return (static_cast<uint8_t>(mode) & static_cast<uint8_t>(cap)) != 0;
+}
+
 std::vector<uint8_t> FastconController::get_light_data(light::LightState *state) {
   // Protocol: 6 bytes when ON
   // [0] 0x80 | (brightness 0..127)
@@ -239,12 +246,36 @@ std::vector<uint8_t> FastconController::get_light_data(light::LightState *state)
     return std::vector<uint8_t>({0x00});
   }
 
-  // Compute final channel levels from current values so brightness/color_brightness are applied.
-  float r=0, g=0, b=0, cw=0, ww=0;
-  state->current_values_as_rgbww(&r, &g, &b, &cw, &ww, /*constant_brightness=*/false);  // per ESPHome light API
+  // Channel RATIOS, deliberately not state->current_values_as_rgbww(). That helper folds the
+  // master brightness into every channel it returns, and gamma-corrects the result - but byte
+  // [0] below already carries the brightness, so using it applied the dimmer twice. Confirmed
+  // live 2026-09-03: HA brightness 15% on light_id 1 produced 92 00 00 00 01 01, i.e. level 18
+  // of 127 (correct) alongside warm=1 cold=1 instead of 128/127, and the bulb read that as off.
+  // The double-scaling is (0.149)^2.8 = 0.0048, which lands on 1 after rounding.
+  //
+  // Gamma goes with it, for two reasons beyond the double-apply. These bytes are nominal
+  // channel levels the bulb's own firmware curves, not PWM duty, so ESPHome's 2.8 default is
+  // correcting for hardware that is not on this side of the radio. And it is what put the
+  // warm/cold pair out of spec at every brightness: gamma(0.3)+gamma(0.7) is 104, where every
+  // captured app frame holds warm+cold to 255. Raw ratios sum to 255 by construction.
+  //
+  // Cost: RGB colors shift, since mid-scale components are no longer pulled down by the curve
+  // (green 0.5 was 37, is now 128). That is the same correction, not a separate regression -
+  // the bulb applies its own curve to what it receives.
+  const auto mode = values.get_color_mode();
+  float r = 0, g = 0, b = 0, cw = 0, ww = 0;
+  if (has_cap(mode, light::ColorCapability::RGB)) {
+    const float cb = values.get_color_brightness();
+    r = values.get_red() * cb;
+    g = values.get_green() * cb;
+    b = values.get_blue() * cb;
+  }
+  if (has_cap(mode, light::ColorCapability::COLD_WARM_WHITE)) {
+    cw = values.get_cold_white();
+    ww = values.get_warm_white();
+  }
 
   // If color mode is WHITE on RGBW fixtures (no CW/WW), map to RGB white.
-  const auto mode = values.get_color_mode();
   // Heuristic: if traits have a valid CT range, we treat device as supporting CW/WW.
   const bool supports_cwww = state->get_traits().get_min_mireds() > 0.0f;
 
@@ -275,7 +306,11 @@ std::vector<uint8_t> FastconController::get_light_data(light::LightState *state)
   // Compose payload
   const float blevel = std::min(values.get_brightness() * 127.0f, 127.0f);
   std::vector<uint8_t> light_data = {
-      static_cast<uint8_t>(0x80 | static_cast<uint8_t>(blevel)),
+      // Rounded, not truncated: fill_call_() decodes this as n/127, so truncation made the
+      // round trip lossy (18 decodes to 0.1417, which re-encoded to 17) and every overheard
+      // frame looked one step off from what we would have sent - which is exactly what the
+      // sniffer's value-matched echo check treats as a genuine new command worth rebroadcasting.
+      static_cast<uint8_t>(0x80 | static_cast<uint8_t>(blevel + 0.5f)),
       to8(b),  // Blue
       to8(r),  // Red
       to8(g),  // Green
@@ -296,7 +331,11 @@ std::vector<uint8_t> FastconController::get_white_light_data(light::LightState *
 
   const float blevel = std::min(values.get_brightness() * 127.0f, 127.0f);
   std::vector<uint8_t> light_data = {
-      static_cast<uint8_t>(0x80 | static_cast<uint8_t>(blevel)),
+      // Rounded, not truncated: fill_call_() decodes this as n/127, so truncation made the
+      // round trip lossy (18 decodes to 0.1417, which re-encoded to 17) and every overheard
+      // frame looked one step off from what we would have sent - which is exactly what the
+      // sniffer's value-matched echo check treats as a genuine new command worth rebroadcasting.
+      static_cast<uint8_t>(0x80 | static_cast<uint8_t>(blevel + 0.5f)),
       0,
       0,
       0,
