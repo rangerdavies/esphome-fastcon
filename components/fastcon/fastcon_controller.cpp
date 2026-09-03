@@ -187,6 +187,19 @@ std::vector<uint8_t> FastconController::get_light_data(light::LightState *state)
     else { r = g = b = 1.0f; }
   }
 
+  // ESPHome's LightColorValues default-constructs cold_white_/warm_white_ to 1.0 each
+  // (light_color_values.h), not 0 - so a CWWW entity that's never had a color explicitly
+  // set (its first-ever ON, exactly the case for a fresh group entity) reaches here with
+  // cw=ww=1.0 rather than tripping the all_zero() fallback above. Sent as-is that's
+  // warm=0xFF, cold=0xFF - summing to 510, not the 255 every real captured frame from the
+  // app shows (protocol expects warm+cold == 255). Normalize down, preserving the ratio,
+  // so a real bulb never sees an out-of-spec pair.
+  if (cw + ww > 1.0f) {
+    const float total = cw + ww;
+    cw /= total;
+    ww /= total;
+  }
+
   // Compose payload
   const float blevel = std::min(values.get_brightness() * 127.0f, 127.0f);
   std::vector<uint8_t> light_data = {
