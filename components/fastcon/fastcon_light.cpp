@@ -37,6 +37,38 @@ light::LightTraits FastconLight::get_traits() {
   return t;
 }
 
+void FastconLight::set_member_ids(const std::vector<int32_t> &ids) {
+  if (this->mode_ == FASTCON_SINGLE) {
+    ESP_LOGW(TAG, "set_members called on light_id %u, which addresses a single light - ignored",
+             (unsigned) this->light_id_);
+    return;
+  }
+
+  std::vector<uint8_t> mask;
+  for (int32_t id : ids) {
+    if (id < 1 || id > 255) {
+      ESP_LOGW(TAG, "Ignoring out-of-range light id %d (valid range 1-255)", (int) id);
+      continue;
+    }
+    const size_t byte = (size_t) (id - 1) / 8;
+    if (mask.size() <= byte)
+      mask.resize(byte + 1, 0);
+    mask[byte] |= 1 << ((id - 1) % 8);
+  }
+
+  if (mask == this->members_) {
+    ESP_LOGD(TAG, "Membership unchanged, nothing to do");
+    return;
+  }
+  this->members_ = mask;
+
+  // Re-apply the current state to the new set straight away. Without this the change
+  // would not take effect until Home Assistant next changed something, and a repeat of
+  // an identical command does not reach write_state() at all.
+  if (this->last_state_ != nullptr)
+    this->write_state(this->last_state_);
+}
+
 uint8_t FastconLight::group_addr_() const {
   return this->mode_ == FASTCON_SHARED_GROUP ? this->controller_->get_group_slot() : this->light_id_;
 }
@@ -46,6 +78,8 @@ void FastconLight::write_state(light::LightState *state) {
     ESP_LOGW(TAG, "No controller bound; dropping command");
     return;
   }
+
+  this->last_state_ = state;
 
   const bool is_group = this->mode_ != FASTCON_SINGLE;
   const unsigned addr = is_group ? (unsigned) this->group_addr_() : (unsigned) this->light_id_;

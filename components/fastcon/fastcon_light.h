@@ -3,7 +3,9 @@
 
 #include <vector>
 #include "esphome/core/component.h"
+#include "esphome/core/automation.h"
 #include "esphome/components/light/light_output.h"
+#include "esphome/components/light/light_state.h"
 
 namespace esphome {
 namespace fastcon {
@@ -30,7 +32,14 @@ class FastconLight : public Component, public light::LightOutput {
   void set_supports_cwww(bool v) { supports_cwww_ = v; }
   void set_color_interlock(bool v) { color_interlock_ = v; }
   void set_mode(FastconAddressMode m) { mode_ = m; }
+
+  /// Compile-time membership: a pre-packed bitmask straight from the YAML.
   void set_members(const std::vector<uint8_t> &mask) { members_ = mask; }
+
+  /// Runtime membership: a list of mesh light ids, packed here and applied at once.
+  /// Ids outside 1..255 are skipped with a warning. An empty list leaves the group
+  /// undefined, which makes the entity a no-op rather than addressing a stale set.
+  void set_member_ids(const std::vector<int32_t> &ids);
 
   // LightOutput interface
   light::LightTraits get_traits() override;
@@ -49,6 +58,22 @@ class FastconLight : public Component, public light::LightOutput {
 
   /// Membership bitmask. Empty when the group is not ours to define.
   std::vector<uint8_t> members_;
+
+  /// Last state written, so a membership change can be re-applied to the new set
+  /// immediately instead of waiting for the next command.
+  light::LightState *last_state_{nullptr};
+};
+
+/// Redefine a group entity's membership at runtime, e.g. from a Home Assistant service.
+template<typename... Ts> class SetMembersAction : public Action<Ts...> {
+ public:
+  explicit SetMembersAction(FastconLight *parent) : parent_(parent) {}
+  TEMPLATABLE_VALUE(std::vector<int32_t>, members)
+
+  void play(Ts... x) override { this->parent_->set_member_ids(this->members_.value(x...)); }
+
+ protected:
+  FastconLight *parent_;
 };
 
 }  // namespace fastcon
