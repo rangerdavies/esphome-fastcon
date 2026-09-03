@@ -446,6 +446,10 @@ void FastconController::dynamic_group_command(uint8_t group_id, const std::vecto
   this->queueCommand(group_id, payload);
   this->send_time_sync();
 
+  // The group frame is on its way; now make the individual entities agree with it, so a
+  // reconciler sees per-light state rather than six lights it believes are unchanged.
+  this->publish_group_members(members, light_data);
+
   ESP_LOGD(TAG, "Dynamic group command: group=%u members=%zu state=%d brightness=%u payload_len=%d",
            (unsigned) group_id, members.size(), (int) state, (unsigned) brightness, (int) payload.size());
 }
@@ -537,6 +541,14 @@ std::vector<uint8_t> FastconController::generate_command(uint8_t n, uint32_t lig
 // ---------------------------------------------------------------------------
 // Passive sniffer - see fastcon_controller.h for what this can and cannot do.
 // ---------------------------------------------------------------------------
+
+void FastconController::publish_group_members(const std::vector<uint8_t> &members,
+                                              const std::vector<uint8_t> &light_data) {
+  for (uint8_t id : members) {
+    for (auto *l : this->lights_)
+      l->publish_group_state(id, light_data);
+  }
+}
 
 int FastconController::observed_group_of(uint8_t light_id) const {
   auto it = this->observed_light_group_.find(light_id);

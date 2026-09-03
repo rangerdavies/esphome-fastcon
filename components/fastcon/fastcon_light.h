@@ -44,6 +44,12 @@ class FastconLight : public Component, public light::LightOutput {
   /// onto it before any command has ever been sent through write_state().
   void set_light_state(light::LightState *s) { light_state_ = s; }
 
+  /// Publish the state a group command just set onto this entity, WITHOUT transmitting
+  /// anything. Called for each member after a group frame goes out, so the individual
+  /// entities in Home Assistant match what the group was told - a reconciler can then act
+  /// on them per-light. No-op unless this entity is that single light.
+  void publish_group_state(uint8_t light_id, const std::vector<uint8_t> &light_data);
+
   /// A command from another controller (the phone app, a scene switch) was overheard.
   /// Publishes it onto this entity if it addresses us. `addr` is a light_id when
   /// `is_group` is false, otherwise a group id.
@@ -54,6 +60,10 @@ class FastconLight : public Component, public light::LightOutput {
   void write_state(light::LightState *state) override;
 
  protected:
+  /// Set the values in `light_data` on a pending LightCall. Shared by the sniffer and by
+  /// group-member propagation, so both interpret the wire bytes identically.
+  void fill_call_(light::LightCall &call, const std::vector<uint8_t> &ld);
+
   /// The group id this entity addresses, resolved against the controller when shared.
   uint8_t group_addr_() const;
 
@@ -78,6 +88,13 @@ class FastconLight : public Component, public light::LightOutput {
   /// value rather than a bare flag, so a genuine command that happens to land in the
   /// same window is still sent.
   std::vector<uint8_t> suppress_echo_;
+
+  /// Unconditional one-shot suppression, for state we published ourselves after a group
+  /// command. Unlike suppress_echo_ this does not compare values: the round trip through
+  /// ESPHome colour model is not lossless, so a value check would let a rounding-step
+  /// difference through and put six individual frames on air right after the group frame
+  /// that was meant to replace them.
+  bool suppress_next_write_{false};
 };
 
 /// Redefine a group entity's membership at runtime, e.g. from a Home Assistant service.

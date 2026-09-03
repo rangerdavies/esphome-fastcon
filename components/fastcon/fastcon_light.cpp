@@ -90,39 +90,64 @@ void FastconLight::apply_observed(bool is_group, uint8_t addr, const std::vector
   }
 
   auto call = this->light_state_->make_call();
-  call.set_transition_length(0);
-
-  if (ld[0] == 0x00) {
-    call.set_state(false);
-  } else {
-    call.set_state(true);
-    call.set_brightness((ld[0] & 0x7f) / 127.0f);
-
-    if (ld.size() >= 6) {
-      const float b = ld[1] / 255.0f, r = ld[2] / 255.0f, g = ld[3] / 255.0f;
-      const uint16_t ww = ld[4], cw = ld[5];
-      if (ld[1] || ld[2] || ld[3]) {
-        call.set_color_mode_if_supported(light::ColorMode::RGB);
-        call.set_rgb(r, g, b);
-      } else if (ww || cw) {
-        // Inverse of get_light_data()'s encoding: byte 4 is warm white, byte 5 cold,
-        // and the pair spans 153-500 mireds linearly.
-        call.set_color_mode_if_supported(light::ColorMode::COLD_WARM_WHITE);
-        // Clamp to the traits range. Floating point puts the ww==0 case a hair under
-        // 153, which ESPHome rejects with "Color temperature value 153.00 is out of
-        // range [153.0 - 500.0]" - a warning whose numbers look identical because the
-        // log rounds what the comparison does not.
-        float mireds = 153.0f + (500.0f - 153.0f) * ww / (float) (ww + cw);
-        mireds = std::max(153.0f, std::min(500.0f, mireds));
-        call.set_color_temperature(mireds);
-      }
-    }
-  }
+  this->fill_call_(call, ld);
 
   // Remember what this will make write_state() compute, so the resulting call does not
   // put a frame back on the air for a command we merely overheard.
   this->suppress_echo_ = ld;
   call.perform();
+}
+
+void FastconLight::fill_call_(light::LightCall &call, const std::vector<uint8_t> &ld) {
+  call.set_transition_length(0);
+
+  if (ld.empty() || ld[0] == 0x00) {
+    call.set_state(false);
+    return;
+  }
+
+  call.set_state(true);
+  call.set_brightness((ld[0] & 0x7f) / 127.0f);
+
+  if (ld.size() >= 6) {
+    const float b = ld[1] / 255.0f, r = ld[2] / 255.0f, g = ld[3] / 255.0f;
+    const uint16_t ww = ld[4], cw = ld[5];
+    if (ld[1] || ld[2] || ld[3]) {
+      call.set_color_mode_if_supported(light::ColorMode::RGB);
+      call.set_rgb(r, g, b);
+    } else if (ww || cw) {
+      // Inverse of get_light_data()'s encoding: byte 4 is warm white, byte 5 cold,
+      // and the pair spans 153-500 mireds linearly.
+      call.set_color_mode_if_supported(light::ColorMode::COLD_WARM_WHITE);
+      // Clamp to the traits range. Floating point puts the ww==0 case a hair under
+      // 153, which ESPHome rejects with "Color temperature value 153.00 is out of
+      // range [153.0 - 500.0]" - a warning whose numbers look identical because the
+      // log rounds what the comparison does not.
+      float mireds = 153.0f + (500.0f - 153.0f) * ww / (float) (ww + cw);
+      mireds = std::max(153.0f, std::min(500.0f, mireds));
+      call.set_color_temperature(mireds);
+    }
+  }
+}
+
+void FastconLight::publish_group_state(uint8_t light_id, const std::vector<uint8_t> &ld) {
+  // Only the individual entity for this mesh id: a group entity's own state is set by
+  // the command that produced this, and other lights are not in this group.
+  if (this->mode_ != FASTCON_SINGLE || this->light_id_ != light_id)
+    return;
+  if (this->light_state_ == nullptr || ld.empty())
+    return;
+
+  auto call = this->light_state_->make_call();
+  this->fill_call_(call, ld);
+
+  // Unconditional, not value-matched: the group frame has already gone out, so any
+  // transmit this triggers would be a duplicate. A value check would let a rounding
+  // step through and put an individual frame on air per member.
+  this->suppress_next_write_ = true;
+  call.perform();
+
+  ESP_LOGD(TAG, "Group state published onto light %u", (unsigned) light_id);
 }
 
 uint8_t FastconLight::group_addr_() const {
@@ -152,6 +177,14 @@ void FastconLight::write_state(light::LightState *state) {
   } else {
     ESP_LOGD(TAG, "Sending RGB/color command for %s %u", is_group ? "group" : "light", addr);
     light_bytes = this->controller_->get_light_data(state);
+  }
+
+  // State we published ourselves after a group command already went out. Transmitting
+  // again would just duplicate it, once per member.
+  if (this->suppress_next_write_) {
+    this->suppress_next_write_ = false;
+    ESP_LOGD(TAG, "Not retransmitting group state for %s %u", is_group ? "group" : "light", addr);
+    return;
   }
 
   // If this write is only the echo of a command we overheard from another controller,

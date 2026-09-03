@@ -150,6 +150,13 @@ namespace esphome
             void set_sniffer_enabled(bool b) { sniffer_enabled_ = b; }
             void register_light(FastconLight *light) { lights_.push_back(light); }
 
+            /// Publish `light_data` onto the individual entity of every listed member, without
+            /// transmitting anything further. Called after a group frame goes out so the
+            /// per-light entities in Home Assistant match what the group was told, which is
+            /// what lets a reconciler act on them individually.
+            void publish_group_members(const std::vector<uint8_t> &members,
+                                       const std::vector<uint8_t> &light_data);
+
             /// Group id a bulb was last observed being assigned to, from a sniffed cmd-1
             /// frame. Returns -1 if we have never seen one for this light.
             int observed_group_of(uint8_t light_id) const;
