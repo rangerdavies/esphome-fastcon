@@ -17,6 +17,8 @@ CONF_MEMBERSHIP_RETRIES = "membership_retries"
 CONF_MEMBERSHIP_TTL = "membership_ttl"
 CONF_GROUP_SLOT = "group_slot"
 CONF_SNIFFER = "sniffer"
+CONF_COMMAND_RETRIES = "command_retries"
+CONF_GROUP_SETTLE = "group_settle"
 
 DEFAULT_ADV_INTERVAL_MIN = 0x20
 DEFAULT_ADV_INTERVAL_MAX = 0x40
@@ -33,6 +35,14 @@ DEFAULT_GROUP_SLOT = 0xFD
 # Off by default: it makes esp32_ble_tracker a hard requirement, and it is only
 # useful when something OTHER than this node also commands the mesh.
 DEFAULT_SNIFFER = False
+
+# Reception on this protocol is roughly 80%% per advertisement, so a single shot loses a
+# bulb about one time in five. Membership writes already repeated; control frames did not.
+DEFAULT_COMMAND_RETRIES = 3
+
+# Pause bracketing each membership write, so a bulb is not reassigned to another group
+# while it is still acting on the frame before it.
+DEFAULT_GROUP_SETTLE = "250ms"
 
 
 def validate_hex_bytes(value):
@@ -88,6 +98,12 @@ CONFIG_SCHEMA = cv.Schema(
         # esp32_ble_tracker a hard requirement and is pointless on a mesh this node
         # is the sole controller of.
         cv.Optional(CONF_SNIFFER, default=DEFAULT_SNIFFER): cv.boolean,
+        cv.Optional(
+            CONF_COMMAND_RETRIES, default=DEFAULT_COMMAND_RETRIES
+        ): cv.int_range(min=1, max=10),
+        cv.Optional(
+            CONF_GROUP_SETTLE, default=DEFAULT_GROUP_SETTLE
+        ): cv.positive_time_period_milliseconds,
     }
 ).extend(cv.COMPONENT_SCHEMA).extend(esp32_ble_tracker.ESP_BLE_DEVICE_SCHEMA)
 
@@ -115,6 +131,8 @@ async def to_code(config):
     cg.add(var.set_membership_retries(config[CONF_MEMBERSHIP_RETRIES]))
     cg.add(var.set_membership_ttl(config[CONF_MEMBERSHIP_TTL]))
     cg.add(var.set_group_slot(config[CONF_GROUP_SLOT]))
+    cg.add(var.set_command_retries(config[CONF_COMMAND_RETRIES]))
+    cg.add(var.set_group_settle(config[CONF_GROUP_SETTLE]))
 
     if config[CONF_SNIFFER]:
         cg.add(var.set_sniffer_enabled(True))

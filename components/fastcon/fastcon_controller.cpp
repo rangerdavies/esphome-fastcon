@@ -25,18 +25,36 @@ namespace fastcon {
 
 static const char *const TAG = "fastcon.controller";
 
-void FastconController::queueCommand(uint32_t light_id_, const std::vector<uint8_t> &data) {
+void FastconController::queueCommand(uint32_t light_id_, const std::vector<uint8_t> &data, uint8_t repeat) {
+  if (repeat == 0)
+    repeat = this->command_retries_;
+
   std::lock_guard<std::mutex> lock(queue_mutex_);
-  if (queue_.size() >= max_queue_size_) {
-    ESP_LOGW(TAG, "Command queue full (size=%d), dropping command for light %d", (int)queue_.size(), (int)light_id_);
-    return;
+  for (uint8_t i = 0; i < repeat; i++) {
+    if (queue_.size() >= max_queue_size_) {
+      ESP_LOGW(TAG, "Command queue full (size=%d), dropping command for light %d (sent %d of %d)",
+               (int)queue_.size(), (int)light_id_, (int)i, (int)repeat);
+      return;
+    }
+    Command cmd;
+    cmd.data = data;
+    cmd.timestamp = millis();
+    cmd.retries = 0;
+    queue_.push(cmd);
   }
+  ESP_LOGV(TAG, "Command queued x%d, queue size: %d", (int)repeat, (int)queue_.size());
+}
+
+void FastconController::queue_settle(uint16_t ms) {
+  if (ms == 0)
+    return;
+  std::lock_guard<std::mutex> lock(queue_mutex_);
+  if (queue_.size() >= max_queue_size_)
+    return;
   Command cmd;
-  cmd.data = data;
+  cmd.settle_ms = ms;  // data stays empty - that is what marks it a pause
   cmd.timestamp = millis();
-  cmd.retries = 0;
   queue_.push(cmd);
-  ESP_LOGV(TAG, "Command queued, queue size: %d", (int)queue_.size());
 }
 
 void FastconController::clear_queue() {
@@ -60,6 +78,16 @@ void FastconController::loop() {
       if (queue_.empty()) return;
       Command cmd = queue_.front();
       queue_.pop();
+
+      // A settling pause carries no frame: idle through the gap state instead of
+      // advertising, so the bulbs get time to act on what was already sent.
+      if (cmd.data.empty()) {
+        pending_settle_ = cmd.settle_ms;
+        adv_state_ = AdvertiseState::GAP;
+        state_start_time_ = now;
+        ESP_LOGV(TAG, "Settling for %ums", (unsigned) cmd.settle_ms);
+        break;
+      }
 
       esp_ble_adv_params_t adv_params = {
           .adv_int_min = adv_interval_min_,
@@ -140,7 +168,8 @@ void FastconController::loop() {
       break;
     }
     case AdvertiseState::GAP: {
-      if (now - state_start_time_ >= adv_gap_) {
+      if (now - state_start_time_ >= (uint32_t) adv_gap_ + pending_settle_) {
+        pending_settle_ = 0;
         adv_state_ = AdvertiseState::IDLE;
         ESP_LOGV(TAG, "Gap period complete");
       }
@@ -338,8 +367,18 @@ void FastconController::ensure_group(uint8_t group_id, const std::vector<uint8_t
   // Lights self-select from this broadcast, and a miss silently drops a light from the
   // group, so repeat it the way the app does.
   auto adv_data = this->set_group_members(group_id, mask);
-  for (uint8_t i = 0; i < this->membership_retries_; i++)
-    this->queueCommand(group_id, adv_data);
+
+  // Bracket the membership write with settling pauses. Before, so a control frame already
+  // in flight to these bulbs is acted on before their group assignment moves under it;
+  // after, so the membership has landed before the control frame that follows addresses
+  // the group. Without the gaps a two-group split queues membership 22, control 22,
+  // membership 23, control 23 back to back at ~60ms a frame, and a bulb that is still
+  // chewing on one frame gets its group reassigned before the next arrives.
+  this->queue_settle(this->group_settle_ms_);
+  // Pass the membership retry count explicitly: queueCommand defaults to
+  // command_retries_, and letting both apply would send this nine times.
+  this->queueCommand(group_id, adv_data, this->membership_retries_);
+  this->queue_settle(this->group_settle_ms_);
 
   this->group_masks_[group_id] = GroupState{mask, millis()};
 }
@@ -444,7 +483,9 @@ void FastconController::send_time_sync() {
   ESP_LOGD(TAG, "Time-sync %04u-%02u-%02u %02u:%02u:%02u", now.year, now.month, now.day_of_month, now.hour,
            now.minute, now.second);
 
-  this->queueCommand(0, this->generate_command(5, 0, data, true));
+  // Once, not command_retries_ times: this carries no state worth re-asserting, and it is
+  // already queued twice around every group action.
+  this->queueCommand(0, this->generate_command(5, 0, data, true), 1);
 #else
   // No `time:` platform anywhere in this build, so time_id could never have been set
   // (its schema requires cv.use_id(time.RealTimeClock)) - time_source_ is always null.

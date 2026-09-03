@@ -80,7 +80,15 @@ namespace esphome
                                         uint8_t blue, uint8_t red, uint8_t green,
                                         uint8_t warm, uint8_t cold);
 
-            void queueCommand(uint32_t light_id_, const std::vector<uint8_t> &data);
+            /// Queue a frame for advertisement, repeated `repeat` times. Reception on this
+            /// protocol is roughly 80%% per advertisement, so a single shot loses a bulb about
+            /// one time in five - which is why every working implementation of it repeats.
+            /// Defaults to command_retries_ when not given; ensure_group() passes its own.
+            void queueCommand(uint32_t light_id_, const std::vector<uint8_t> &data, uint8_t repeat = 0);
+
+            /// Queue a pause. Nothing is advertised; the queue simply idles, giving the bulbs
+            /// time to act on what came before it.
+            void queue_settle(uint16_t ms);
 
             void clear_queue();
             bool is_queue_empty() const
@@ -95,6 +103,8 @@ namespace esphome
             }
             void set_max_queue_size(size_t size) { max_queue_size_ = size; }
             void set_membership_retries(uint8_t n) { membership_retries_ = n; }
+            void set_command_retries(uint8_t n) { command_retries_ = n; }
+            void set_group_settle(uint16_t ms) { group_settle_ms_ = ms; }
             /// No longer affects behavior (2026-09-03) - ensure_group() rewrites membership
             /// unconditionally on every call now, see its own header comment. Kept only so the
             /// `fastcon: membership_ttl:` YAML option (fastcon_controller.py) still compiles for
@@ -183,7 +193,8 @@ namespace esphome
 
             struct Command
             {
-                std::vector<uint8_t> data;
+                std::vector<uint8_t> data;  // empty = a settling pause, not a frame
+                uint16_t settle_ms{0};
                 uint32_t timestamp;
                 uint8_t retries{0};
                 static constexpr uint8_t MAX_RETRIES = 3;
@@ -219,6 +230,9 @@ namespace esphome
             /// says nothing about whether a DIFFERENT group_id's write has since evicted it).
             std::map<uint8_t, GroupState> group_masks_;
             uint8_t membership_retries_{3};
+            uint8_t command_retries_{3};
+            uint16_t group_settle_ms_{250};
+            uint16_t pending_settle_{0};
             uint32_t membership_ttl_{30000};  // unused - see set_membership_ttl()'s own comment
             uint8_t group_slot_{0xfd};
 
