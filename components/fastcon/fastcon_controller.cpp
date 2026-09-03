@@ -12,7 +12,9 @@
 #include "esphome/components/time/real_time_clock.h"
 #endif
 #include "fastcon_controller.h"
+#include "fastcon_light.h"
 #include "protocol.h"
+#include "utils.h"
 
 #ifndef FASTCON_VERSION
 #define FASTCON_VERSION "0.3.2-dev"
@@ -485,6 +487,114 @@ std::vector<uint8_t> FastconController::generate_command(uint8_t n, uint32_t lig
 
   std::vector<uint8_t> addr = {DEFAULT_BLE_FASTCON_ADDRESS.begin(), DEFAULT_BLE_FASTCON_ADDRESS.end()};
   return prepare_payload(addr, body);
+}
+
+// ---------------------------------------------------------------------------
+// Passive sniffer - see fastcon_controller.h for what this can and cannot do.
+// ---------------------------------------------------------------------------
+
+int FastconController::observed_group_of(uint8_t light_id) const {
+  auto it = this->observed_light_group_.find(light_id);
+  return it == this->observed_light_group_.end() ? -1 : (int) it->second;
+}
+
+#ifdef USE_ESP32_BLE_TRACKER
+bool FastconController::parse_device(const esp32_ble_tracker::ESPBTDevice &device) {
+  if (!this->sniffer_enabled_)
+    return false;
+
+  for (auto &md : device.get_manufacturer_datas()) {
+    if (md.uuid.get_uuid().len != ESP_UUID_LEN_16)
+      continue;
+    if (md.uuid.get_uuid().uuid.uuid16 != MANUFACTURER_DATA_ID)
+      continue;
+    this->handle_sniffed_payload_(md.data);
+  }
+  return false;  // never claim the device - bluetooth_proxy still wants to see it
+}
+#endif
+
+void FastconController::handle_sniffed_payload_(const std::vector<uint8_t> &payload) {
+  // Whitening XORs against a position-keyed stream and is therefore its own inverse,
+  // but that stream starts 0xf bytes before the part which goes on the air. Rebuild the
+  // offset so the keystream lines up, then take the padding back off.
+  std::vector<uint8_t> buf(0xf, 0);
+  buf.insert(buf.end(), payload.begin(), payload.end());
+  WhiteningContext ctx;
+  whitening_init(0x25, ctx);
+  whitening_encode(buf, ctx);
+  std::vector<uint8_t> pre(buf.begin() + 0xf, buf.end());
+
+  std::vector<uint8_t> body;
+  if (pre.size() >= 8 && pre[0] == 0xa5 && pre[1] == 0x5a) {
+    // Membership framing: marker then body, no address and no CRC.
+    body.assign(pre.begin() + 2, pre.end());
+  } else if (pre.size() >= 12 && pre[0] == 0x8e && pre[1] == 0xf0 && pre[2] == 0xaa) {
+    // Control framing. 0x8e/0xf0/0xaa are reverse_8() of 0x71/0x0f/0x55; three address
+    // bytes follow it and a CRC16 trails.
+    body.assign(pre.begin() + 6, pre.end() - 2);
+  } else {
+    return;  // not a fastcon frame
+  }
+
+  if (body.size() < 5)
+    return;
+
+  for (size_t i = 0; i < 4; i++)
+    body[i] ^= DEFAULT_ENCRYPT_KEY[i & 3];
+  for (size_t i = 4; i < body.size(); i++)
+    body[i] ^= this->mesh_key_[(i - 4) & 3];
+
+  // Two independent checks that this decoded cleanly and belongs to our mesh. A frame
+  // from a neighbour's mesh decrypts to noise and fails both.
+  if (body[2] != this->mesh_key_[3])
+    return;
+  uint8_t sum = 0;
+  for (size_t i = 0; i < body.size(); i++) {
+    if (i != 3)
+      sum += body[i];
+  }
+  if (sum != body[3])
+    return;
+
+  this->dispatch_observed_(std::vector<uint8_t>(body.begin() + 4, body.end()));
+}
+
+void FastconController::dispatch_observed_(const std::vector<uint8_t> &inner) {
+  if (inner.empty())
+    return;
+
+  const uint8_t cmd = inner[0] & 0x0f;
+  const size_t declared = (inner[0] >> 4) & 0x0f;  // count of bytes following inner[0]
+
+  if (cmd == 1 && inner.size() >= 3) {
+    // Group assignment. Not a state change in itself, but it records which group a bulb
+    // is in, which is what lets a sniffed group command reach individual entities.
+    this->observed_light_group_[inner[1]] = inner[2];
+    ESP_LOGD(TAG, "Observed: light %u assigned to group %u", (unsigned) inner[1], (unsigned) inner[2]);
+    return;
+  }
+
+  // The declared length matters: light_data is padded with zeros out to 12 bytes, and
+  // reading the padding would turn a plain on/off into a full colour command.
+  if (cmd == 2 && declared >= 1 && inner.size() >= 1 + declared) {
+    std::vector<uint8_t> ld(inner.begin() + 2, inner.begin() + 1 + declared);
+    ESP_LOGD(TAG, "Observed: light %u, %u data byte(s)", (unsigned) inner[1], (unsigned) ld.size());
+    for (auto *l : this->lights_)
+      l->apply_observed(false, inner[1], ld);
+    return;
+  }
+
+  if (cmd == 3 && declared >= 3 && inner.size() >= 1 + declared && inner[1] == GROUP_MARKER_HI &&
+      inner[2] == GROUP_MARKER_LO) {
+    std::vector<uint8_t> ld(inner.begin() + 4, inner.begin() + 1 + declared);
+    ESP_LOGD(TAG, "Observed: group %u, %u data byte(s)", (unsigned) inner[3], (unsigned) ld.size());
+    for (auto *l : this->lights_)
+      l->apply_observed(true, inner[3], ld);
+    return;
+  }
+
+  // cmd 5 (membership bitmask) and cmd 9 (time sync) carry no state worth publishing.
 }
 
 } // namespace fastcon

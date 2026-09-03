@@ -1,10 +1,11 @@
 import esphome.codegen as cg
+from esphome.components import esp32_ble_tracker
 from esphome.components import time as time_
 import esphome.config_validation as cv
 from esphome.const import CONF_ID, CONF_TIME_ID
 from esphome.core import HexInt
 
-DEPENDENCIES = ["esp32_ble"]
+DEPENDENCIES = ["esp32_ble", "esp32_ble_tracker"]
 
 CONF_MESH_KEY = "mesh_key"
 CONF_ADV_INTERVAL_MIN = "adv_interval_min"
@@ -15,6 +16,7 @@ CONF_MAX_QUEUE_SIZE = "max_queue_size"
 CONF_MEMBERSHIP_RETRIES = "membership_retries"
 CONF_MEMBERSHIP_TTL = "membership_ttl"
 CONF_GROUP_SLOT = "group_slot"
+CONF_SNIFFER = "sniffer"
 
 DEFAULT_ADV_INTERVAL_MIN = 0x20
 DEFAULT_ADV_INTERVAL_MAX = 0x40
@@ -27,6 +29,10 @@ DEFAULT_MEMBERSHIP_TTL = "30s"
 # The id the BRMesh app itself uses for ad-hoc multi-selections. Proven to work on real
 # hardware, which an id the app never issues is not.
 DEFAULT_GROUP_SLOT = 0xFD
+
+# Off by default: it makes esp32_ble_tracker a hard requirement, and it is only
+# useful when something OTHER than this node also commands the mesh.
+DEFAULT_SNIFFER = False
 
 
 def validate_hex_bytes(value):
@@ -75,8 +81,15 @@ CONFIG_SCHEMA = cv.Schema(
         # time-sync frame (matching the app's own observed habit) improves membership-
         # write/group-control reception. No effect on single-light entities.
         cv.Optional(CONF_TIME_ID): cv.use_id(time_.RealTimeClock),
+        # Listen for commands sent by OTHER controllers on this mesh - the phone app,
+        # a FastCon scene switch - and publish them onto the matching entities. The
+        # bulbs themselves never report anything, so this is the only way Home
+        # Assistant learns about a change it did not make. Off by default: it makes
+        # esp32_ble_tracker a hard requirement and is pointless on a mesh this node
+        # is the sole controller of.
+        cv.Optional(CONF_SNIFFER, default=DEFAULT_SNIFFER): cv.boolean,
     }
-).extend(cv.COMPONENT_SCHEMA)
+).extend(cv.COMPONENT_SCHEMA).extend(esp32_ble_tracker.ESP_BLE_DEVICE_SCHEMA)
 
 
 async def to_code(config):
@@ -102,6 +115,10 @@ async def to_code(config):
     cg.add(var.set_membership_retries(config[CONF_MEMBERSHIP_RETRIES]))
     cg.add(var.set_membership_ttl(config[CONF_MEMBERSHIP_TTL]))
     cg.add(var.set_group_slot(config[CONF_GROUP_SLOT]))
+
+    if config[CONF_SNIFFER]:
+        cg.add(var.set_sniffer_enabled(True))
+        await esp32_ble_tracker.register_ble_device(var, config)
 
     if CONF_TIME_ID in config:
         time_var = await cg.get_variable(config[CONF_TIME_ID])

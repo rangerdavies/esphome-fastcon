@@ -69,6 +69,55 @@ void FastconLight::set_member_ids(const std::vector<int32_t> &ids) {
     this->write_state(this->last_state_);
 }
 
+void FastconLight::apply_observed(bool is_group, uint8_t addr, const std::vector<uint8_t> &ld) {
+  if (this->light_state_ == nullptr || ld.empty())
+    return;
+
+  // Does this frame address us?
+  if (is_group) {
+    if (this->mode_ == FASTCON_SINGLE) {
+      // Group 0 is the firmware "all lights" group, so it always includes us. For any
+      // other group we only know we are a member if we overheard the assignment.
+      if (addr != 0 && this->controller_->observed_group_of(this->light_id_) != (int) addr)
+        return;
+    } else if (this->group_addr_() != addr) {
+      return;
+    }
+  } else {
+    if (this->mode_ != FASTCON_SINGLE || this->light_id_ != addr)
+      return;
+  }
+
+  auto call = this->light_state_->make_call();
+  call.set_transition_length(0);
+
+  if (ld[0] == 0x00) {
+    call.set_state(false);
+  } else {
+    call.set_state(true);
+    call.set_brightness((ld[0] & 0x7f) / 127.0f);
+
+    if (ld.size() >= 6) {
+      const float b = ld[1] / 255.0f, r = ld[2] / 255.0f, g = ld[3] / 255.0f;
+      const uint16_t ww = ld[4], cw = ld[5];
+      if (ld[1] || ld[2] || ld[3]) {
+        call.set_color_mode_if_supported(light::ColorMode::RGB);
+        call.set_rgb(r, g, b);
+      } else if (ww || cw) {
+        // Inverse of get_light_data()'s encoding: byte 4 is warm white, byte 5 cold,
+        // and the pair spans 153-500 mireds linearly.
+        call.set_color_mode_if_supported(light::ColorMode::COLD_WARM_WHITE);
+        call.set_color_temperature(153.0f + (500.0f - 153.0f) * ww / (float) (ww + cw));
+      }
+    }
+  }
+
+  // Remember what this will make write_state() compute, so the resulting call does not
+  // put a frame back on the air for a command we merely overheard.
+  this->suppress_echo_ = ld;
+  call.perform();
+}
+
 uint8_t FastconLight::group_addr_() const {
   return this->mode_ == FASTCON_SHARED_GROUP ? this->controller_->get_group_slot() : this->light_id_;
 }
@@ -96,6 +145,18 @@ void FastconLight::write_state(light::LightState *state) {
   } else {
     ESP_LOGD(TAG, "Sending RGB/color command for %s %u", is_group ? "group" : "light", addr);
     light_bytes = this->controller_->get_light_data(state);
+  }
+
+  // If this write is only the echo of a command we overheard from another controller,
+  // publishing it was the whole point - putting it back on the air is not.
+  if (!this->suppress_echo_.empty()) {
+    const bool echo = (light_bytes == this->suppress_echo_);
+    this->suppress_echo_.clear();
+    if (echo) {
+      ESP_LOGD(TAG, "Not rebroadcasting an overheard command for %s %u",
+               is_group ? "group" : "light", addr);
+      return;
+    }
   }
 
   // Wrap into the inner payload for this address

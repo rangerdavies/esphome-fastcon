@@ -40,6 +40,15 @@ class FastconLight : public Component, public light::LightOutput {
   /// undefined, which makes the entity a no-op rather than addressing a stale set.
   void set_member_ids(const std::vector<int32_t> &ids);
 
+  /// The LightState this output backs, wired up in light.py so the sniffer can publish
+  /// onto it before any command has ever been sent through write_state().
+  void set_light_state(light::LightState *s) { light_state_ = s; }
+
+  /// A command from another controller (the phone app, a scene switch) was overheard.
+  /// Publishes it onto this entity if it addresses us. `addr` is a light_id when
+  /// `is_group` is false, otherwise a group id.
+  void apply_observed(bool is_group, uint8_t addr, const std::vector<uint8_t> &light_data);
+
   // LightOutput interface
   light::LightTraits get_traits() override;
   void write_state(light::LightState *state) override;
@@ -61,6 +70,14 @@ class FastconLight : public Component, public light::LightOutput {
   /// Last state written, so a membership change can be re-applied to the new set
   /// immediately instead of waiting for the next command.
   light::LightState *last_state_{nullptr};
+
+  light::LightState *light_state_{nullptr};
+
+  /// Set when the sniffer publishes an overheard command, so the write_state() that
+  /// publishing triggers does not rebroadcast a frame we only listened to. Matched by
+  /// value rather than a bare flag, so a genuine command that happens to land in the
+  /// same window is still sent.
+  std::vector<uint8_t> suppress_echo_;
 };
 
 /// Redefine a group entity's membership at runtime, e.g. from a Home Assistant service.

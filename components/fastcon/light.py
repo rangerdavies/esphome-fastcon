@@ -138,5 +138,11 @@ async def to_code(config):
     controller = await cg.get_variable(config[CONF_CONTROLLER_ID])
     cg.add(var.set_controller(controller))
 
+    # Hand the entity its own LightState and register it with the controller, so the
+    # passive sniffer can publish an overheard command onto it. Without this the output
+    # has no way back to the entity until write_state() first hands it one.
+    cg.add(var.set_light_state(await cg.get_variable(config[CONF_ID])))
+    cg.add(controller.register_light(var))
+
     if config.get(CONF_SUPPORTS_CWWW):
         cg.add(var.set_supports_cwww(True))

@@ -5,7 +5,11 @@
 #include <mutex>
 #include <vector>
 #include "esphome/core/component.h"
+#include "esphome/core/defines.h"
 #include "esphome/components/esp32_ble_server/ble_server.h"
+#ifdef USE_ESP32_BLE_TRACKER
+#include "esphome/components/esp32_ble_tracker/esp32_ble_tracker.h"
+#endif
 
 namespace esphome
 {
@@ -16,8 +20,13 @@ namespace esphome
 
     namespace fastcon
     {
+        class FastconLight;
 
         class FastconController : public Component
+#ifdef USE_ESP32_BLE_TRACKER
+            ,
+                                  public esp32_ble_tracker::ESPBTDeviceListener
+#endif
         {
         public:
             FastconController() = default;
@@ -109,7 +118,48 @@ namespace esphome
             void set_adv_gap(uint16_t val) { adv_gap_ = val; }
             void set_time_source(time::RealTimeClock *time_source) { time_source_ = time_source; }
 
+            // ---------------------------------------------------------------------------
+            // Passive sniffer
+            //
+            // These bulbs never report anything: the protocol is one-way non-connectable
+            // advertising, there is no GATT to read, no query command exists in any of the
+            // five observed command types, and the phone app itself only tracks what it
+            // sent. So this cannot ask a bulb its state.
+            //
+            // What it CAN do is hear every OTHER controller on the mesh. The phone app and
+            // any FastCon scene switch broadcast their commands in the clear on the same
+            // manufacturer id, under the same mesh key. Decoding those keeps Home Assistant
+            // in step when somebody picks up their phone - the case that actually makes
+            // state go stale in practice.
+            //
+            // Limits, stated plainly: this observes what was COMMANDED, not what a bulb is
+            // doing. A bulb that missed the frame still reports wrong, and one switched off
+            // at the wall is invisible. It narrows the drift, it does not remove it.
+            // ---------------------------------------------------------------------------
+            void set_sniffer_enabled(bool b) { sniffer_enabled_ = b; }
+            void register_light(FastconLight *light) { lights_.push_back(light); }
+
+            /// Group id a bulb was last observed being assigned to, from a sniffed cmd-1
+            /// frame. Returns -1 if we have never seen one for this light.
+            int observed_group_of(uint8_t light_id) const;
+
+#ifdef USE_ESP32_BLE_TRACKER
+            bool parse_device(const esp32_ble_tracker::ESPBTDevice &device) override;
+#endif
+
         protected:
+            /// Un-whiten, unwrap and decrypt one 0xfff0 manufacturer payload, then dispatch
+            /// it. Silently drops anything that is not a well-formed frame for our mesh.
+            void handle_sniffed_payload_(const std::vector<uint8_t> &payload);
+            void dispatch_observed_(const std::vector<uint8_t> &inner);
+
+            bool sniffer_enabled_{false};
+            std::vector<FastconLight *> lights_;
+
+            /// light_id -> group_id, learned from sniffed cmd-1 assignment frames. Lets a
+            /// sniffed group command update the individual entities that group contains.
+            std::map<uint8_t, uint8_t> observed_light_group_;
+
             struct Command
             {
                 std::vector<uint8_t> data;
