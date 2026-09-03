@@ -326,6 +326,62 @@ void FastconController::ensure_group(uint8_t group_id, const std::vector<uint8_t
   this->group_masks_[group_id] = GroupState{mask, now};
 }
 
+// Dynamic groups (2026-09-02 night): brightness arrives already on the 0-127 wire scale and
+// blue/red/green/warm/cold already on the 0-255 wire scale, computed by the CALLER (an
+// `api: actions:` lambda fed by an HA-side Jinja template, see brmesh-bridge.yaml and
+// scripts.yaml's living_room_tv_low) rather than here. Deliberate: get_light_data()'s own
+// color_temp_kelvin-to-warm/cold conversion depends on light::LightState/LightTraits (mireds
+// range, current color mode) that a group with no backing entity simply doesn't have, and
+// hand-rolling a second, separate implementation of that conversion in this file would risk
+// silently diverging from the one individual/static-group entities already use - producing a
+// visibly different color for the exact same nominal Kelvin depending on which dispatch path
+// commanded it. Keeping this method dumb (pack whatever bytes it's given) means there is
+// exactly one place color math happens for BrMesh commands overall right now: HA-side Jinja,
+// auditable and adjustable without a firmware recompile - see
+// docs/fastcongroupconfig.md's "Dynamic groups (api action)" section for the exact formula.
+void FastconController::dynamic_group_command(uint8_t group_id, const std::vector<uint8_t> &members,
+                                                bool state, uint8_t brightness,
+                                                uint8_t blue, uint8_t red, uint8_t green,
+                                                uint8_t warm, uint8_t cold) {
+  // Same bitmask packing as FastconLight::set_member_ids() (fastcon_light.cpp) - bit N of
+  // byte K addresses light_id 8K+N+1 - duplicated rather than shared because that method
+  // lives on an entity (mutates this->members_, re-applies last_state_) and this path has
+  // neither; both independently match docs/fastcongroupconfig.md's documented mask rule.
+  std::vector<uint8_t> mask;
+  for (uint8_t id : members) {
+    if (id < 1) {
+      ESP_LOGW(TAG, "Ignoring out-of-range dynamic group member id %u (must be >= 1)", (unsigned) id);
+      continue;
+    }
+    const size_t byte = (size_t) (id - 1) / 8;
+    if (mask.size() <= byte)
+      mask.resize(byte + 1, 0);
+    mask[byte] |= 1 << ((id - 1) % 8);
+  }
+
+  // Same time-sync bracketing + ensure_group/group_control/queueCommand order as
+  // FastconLight::write_state()'s own group path - see that method's own comments
+  // (fastcon_light.cpp) for why.
+  this->send_time_sync();
+  this->ensure_group(group_id, mask);
+
+  std::vector<uint8_t> light_data;
+  if (!state) {
+    light_data = {0x00};
+  } else {
+    light_data = {
+        static_cast<uint8_t>(0x80 | (brightness & 0x7F)),
+        blue, red, green, warm, cold,
+    };
+  }
+  auto payload = this->group_control(group_id, light_data);
+  this->queueCommand(group_id, payload);
+  this->send_time_sync();
+
+  ESP_LOGD(TAG, "Dynamic group command: group=%u members=%zu state=%d brightness=%u payload_len=%d",
+           (unsigned) group_id, members.size(), (int) state, (unsigned) brightness, (int) payload.size());
+}
+
 void FastconController::send_time_sync() {
 #ifdef USE_TIME
   if (this->time_source_ == nullptr) {

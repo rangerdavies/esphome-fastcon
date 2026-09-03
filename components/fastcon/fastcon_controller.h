@@ -40,6 +40,26 @@ namespace esphome
             /// configured or the clock hasn't synced yet.
             void send_time_sync();
 
+            /// Define (or redefine) an arbitrary group's membership and command it directly, with
+            /// no backing `platform: fastcon` light entity and no light::LightState* - the caller
+            /// (an `api: actions:` lambda, see brmesh-bridge.yaml) supplies every light_data byte
+            /// already computed. `members` are raw mesh light_ids (1-based, matching
+            /// set_group_members()'s own numbering - NOT the HA-facing "Light N" numbering used
+            /// in scripts.yaml, same caveat as every other members: list in this repo).
+            /// `group_id` must not collide with a group_id already owned by a static entity (0 is
+            /// firmware-owned "all"; any group_id used by a `platform: fastcon` entity in YAML is
+            /// that entity's own) or the shared group_slot - pick an unused id per ad-hoc group.
+            /// `brightness` is 0-127 (the wire scale, already divided down from HA's 0-255 - see
+            /// this method's own .cpp comment for why no scaling happens here). `blue`/`red`/
+            /// `green`/`warm`/`cold` are each 0-255, matching get_light_data()'s own wire format.
+            /// Same ensure_group()+group_control()+queueCommand()+send_time_sync() sequence as
+            /// FastconLight::write_state()'s own group path (fastcon_light.cpp) - deliberately not
+            /// factored into a shared helper, to keep that entity-bound path untouched by this one.
+            void dynamic_group_command(uint8_t group_id, const std::vector<uint8_t> &members,
+                                        bool state, uint8_t brightness,
+                                        uint8_t blue, uint8_t red, uint8_t green,
+                                        uint8_t warm, uint8_t cold);
+
             void queueCommand(uint32_t light_id_, const std::vector<uint8_t> &data);
 
             void clear_queue();
