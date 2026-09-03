@@ -347,21 +347,32 @@ void FastconController::dynamic_group_command(uint8_t group_id, const std::vecto
   // byte K addresses light_id 8K+N+1 - duplicated rather than shared because that method
   // lives on an entity (mutates this->members_, re-applies last_state_) and this path has
   // neither; both independently match docs/fastcongroupconfig.md's documented mask rule.
+  //
+  // group_id 0 is firmware-owned ("all lights") and never gets a membership write, same
+  // rule light.py's _validate_addressing() enforces at compile time for a static entity
+  // (`group_id: 0` + `members:` together is a config error there) - enforced here too,
+  // defensively, since a dynamic caller has no such compile-time check. A caller wanting
+  // group 0 (e.g. living_room_lights_evening, scripts.yaml) can still pass all 6 member
+  // ids for its own target_state/believed_state bookkeeping; the mask is simply never
+  // computed or written for this one reserved id.
   std::vector<uint8_t> mask;
-  for (uint8_t id : members) {
-    if (id < 1) {
-      ESP_LOGW(TAG, "Ignoring out-of-range dynamic group member id %u (must be >= 1)", (unsigned) id);
-      continue;
+  if (group_id != 0) {
+    for (uint8_t id : members) {
+      if (id < 1) {
+        ESP_LOGW(TAG, "Ignoring out-of-range dynamic group member id %u (must be >= 1)", (unsigned) id);
+        continue;
+      }
+      const size_t byte = (size_t) (id - 1) / 8;
+      if (mask.size() <= byte)
+        mask.resize(byte + 1, 0);
+      mask[byte] |= 1 << ((id - 1) % 8);
     }
-    const size_t byte = (size_t) (id - 1) / 8;
-    if (mask.size() <= byte)
-      mask.resize(byte + 1, 0);
-    mask[byte] |= 1 << ((id - 1) % 8);
   }
 
   // Same time-sync bracketing + ensure_group/group_control/queueCommand order as
   // FastconLight::write_state()'s own group path - see that method's own comments
-  // (fastcon_light.cpp) for why.
+  // (fastcon_light.cpp) for why. ensure_group() itself already no-ops on an empty mask
+  // (group 0's own case, per the guard above, and any group_id passed with no members).
   this->send_time_sync();
   this->ensure_group(group_id, mask);
 

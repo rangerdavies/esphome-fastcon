@@ -49,6 +49,10 @@ namespace esphome
             /// `group_id` must not collide with a group_id already owned by a static entity (0 is
             /// firmware-owned "all"; any group_id used by a `platform: fastcon` entity in YAML is
             /// that entity's own) or the shared group_slot - pick an unused id per ad-hoc group.
+            /// `group_id == 0` is explicitly safe to pass, though: it's treated as the same
+            /// firmware-owned "all" group static entities use, and `members` is silently ignored
+            /// for it (no membership write is ever attempted) - a caller wanting group 0 can still
+            /// pass every member id, purely for its own target_state/believed_state bookkeeping.
             /// `brightness` is 0-127 (the wire scale, already divided down from HA's 0-255 - see
             /// this method's own .cpp comment for why no scaling happens here). `blue`/`red`/
             /// `green`/`warm`/`cold` are each 0-255, matching get_light_data()'s own wire format.
