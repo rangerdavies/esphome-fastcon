@@ -9,6 +9,11 @@
 
 namespace esphome
 {
+    namespace time
+    {
+        class RealTimeClock;
+    }
+
     namespace fastcon
     {
 
@@ -28,6 +33,12 @@ namespace esphome
 
             /// Write the membership of `group_id` unless the mesh already holds it and it is fresh.
             void ensure_group(uint8_t group_id, const std::vector<uint8_t> &mask);
+
+            /// Queue a cmd-9 time-sync frame, matching the app's own habit of sending one right
+            /// before and right after a group action - a live A/B test for whether that primes
+            /// the mesh into a more receptive state. No-op (logs at debug) if no time source is
+            /// configured or the clock hasn't synced yet.
+            void send_time_sync();
 
             void queueCommand(uint32_t light_id_, const std::vector<uint8_t> &data);
 
@@ -62,6 +73,7 @@ namespace esphome
             }
             void set_adv_duration(uint16_t val) { adv_duration_ = val; }
             void set_adv_gap(uint16_t val) { adv_gap_ = val; }
+            void set_time_source(time::RealTimeClock *time_source) { time_source_ = time_source; }
 
         protected:
             struct Command
@@ -108,6 +120,9 @@ namespace esphome
             uint16_t adv_interval_max_{0x40};
             uint16_t adv_duration_{50};
             uint16_t adv_gap_{10};
+
+            /// Optional - unset unless `time_id` is configured. See send_time_sync().
+            time::RealTimeClock *time_source_{nullptr};
 
             static const uint16_t MANUFACTURER_DATA_ID = 0xfff0;
             static const uint8_t GROUP_MARKER_HI = 0x2a;

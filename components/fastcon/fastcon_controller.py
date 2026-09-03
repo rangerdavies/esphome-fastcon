@@ -1,6 +1,7 @@
 import esphome.codegen as cg
+from esphome.components import time as time_
 import esphome.config_validation as cv
-from esphome.const import CONF_ID
+from esphome.const import CONF_ID, CONF_TIME_ID
 from esphome.core import HexInt
 
 DEPENDENCIES = ["esp32_ble"]
@@ -70,6 +71,10 @@ CONFIG_SCHEMA = cv.Schema(
         cv.Optional(CONF_GROUP_SLOT, default=DEFAULT_GROUP_SLOT): cv.int_range(
             min=1, max=255
         ),
+        # Optional - live test of whether bracketing a group action with a cmd-9
+        # time-sync frame (matching the app's own observed habit) improves membership-
+        # write/group-control reception. No effect on single-light entities.
+        cv.Optional(CONF_TIME_ID): cv.use_id(time_.RealTimeClock),
     }
 ).extend(cv.COMPONENT_SCHEMA)
 
@@ -97,3 +102,7 @@ async def to_code(config):
     cg.add(var.set_membership_retries(config[CONF_MEMBERSHIP_RETRIES]))
     cg.add(var.set_membership_ttl(config[CONF_MEMBERSHIP_TTL]))
     cg.add(var.set_group_slot(config[CONF_GROUP_SLOT]))
+
+    if CONF_TIME_ID in config:
+        time_var = await cg.get_variable(config[CONF_TIME_ID])
+        cg.add(var.set_time_source(time_var))

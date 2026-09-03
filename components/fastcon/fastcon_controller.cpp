@@ -5,6 +5,7 @@
 #include <algorithm>
 #include "esphome/components/light/color_mode.h"
 #include "esphome/components/light/light_state.h"
+#include "esphome/components/time/real_time_clock.h"
 #include "fastcon_controller.h"
 #include "protocol.h"
 
@@ -318,6 +319,41 @@ void FastconController::ensure_group(uint8_t group_id, const std::vector<uint8_t
     this->queueCommand(group_id, adv_data);
 
   this->group_masks_[group_id] = GroupState{mask, now};
+}
+
+void FastconController::send_time_sync() {
+  if (this->time_source_ == nullptr) {
+    ESP_LOGV(TAG, "No time source configured, skipping time-sync frame");
+    return;
+  }
+  auto now = this->time_source_->now();
+  if (!now.is_valid()) {
+    ESP_LOGV(TAG, "Time not synced yet, skipping time-sync frame");
+    return;
+  }
+
+  // cmd 9, [0]=0x89 [1]=0x00 [2..8]=yy mm dd dow hh mm ss, zero-padded to 12 bytes -
+  // reverse-engineered from real BRMesh app captures (see docs/fastcongroupconfig.md).
+  // ESPHome's day_of_week is Sunday=1..Saturday=7; the app's own frames use ISO
+  // (Monday=1..Sunday=7), confirmed against captures where a Wednesday encoded as 3.
+  uint8_t dow = now.day_of_week - 1;
+  if (dow == 0) dow = 7;
+
+  std::vector<uint8_t> data(12, 0);
+  data[0] = 0x89;
+  data[1] = 0x00;
+  data[2] = now.year % 100;
+  data[3] = now.month;
+  data[4] = now.day_of_month;
+  data[5] = dow;
+  data[6] = now.hour;
+  data[7] = now.minute;
+  data[8] = now.second;
+
+  ESP_LOGD(TAG, "Time-sync %04u-%02u-%02u %02u:%02u:%02u", now.year, now.month, now.day_of_month, now.hour,
+           now.minute, now.second);
+
+  this->queueCommand(0, this->generate_command(5, 0, data, true));
 }
 
 std::vector<uint8_t> FastconController::generate_command(uint8_t n, uint32_t light_id_, const std::vector<uint8_t> &data, bool forward,

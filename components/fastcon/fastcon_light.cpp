@@ -67,6 +67,12 @@ void FastconLight::write_state(light::LightState *state) {
   // Wrap into the inner payload for this address
   std::vector<uint8_t> payload;
   if (is_group) {
+    // The app is observed to send a cmd-9 time-sync frame right before and right after
+    // a group action - live A/B test of whether that primes the mesh into a more
+    // receptive state for the membership-write/group-control frames that follow. No-op
+    // if no time_id is configured on the controller.
+    this->controller_->send_time_sync();
+
     // Claim the slot before addressing it. No-ops while the mesh already holds this
     // membership, so a repeated command costs one frame instead of four.
     this->controller_->ensure_group((uint8_t) addr, this->members_);
@@ -77,6 +83,9 @@ void FastconLight::write_state(light::LightState *state) {
 
   // Queue it for advertisement
   this->controller_->queueCommand(addr, payload);
+
+  if (is_group)
+    this->controller_->send_time_sync();
 
   ESP_LOGD(TAG, "Queued state v%s: %s=%u, payload_len=%d",
            FASTCON_VERSION, is_group ? "group" : "light_id", addr, (int)payload.size());
