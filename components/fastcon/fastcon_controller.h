@@ -2,6 +2,7 @@
 
 #include <queue>
 #include <deque>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <vector>
@@ -89,6 +90,38 @@ namespace esphome
             /// Queue a pause. Nothing is advertised; the queue simply idles, giving the bulbs
             /// time to act on what came before it.
             void queue_settle(uint16_t ms);
+
+            /// Schedule `redo` to run again at +1s and +5s from now, in case the whole burst
+            /// just sent (membership + control, or just control for a single light) was missed
+            /// entirely - command_retries_/membership_retries_ already cover a single dropped
+            /// frame within one burst, but not a bulb that was unreachable for the whole burst
+            /// (briefly out of range, mid-relay of something else, RF interference). Added
+            /// 2026-09-03 per direct request, after confirming live that HA's own recorded
+            /// state can be correct while a bulb never actually receives anything - the
+            /// reconciler has no way to notice that (see scripts.yaml's own target_state vs
+            /// believed_state design - believed_state is written the moment a command is SENT,
+            /// not confirmed), so this is the mesh-level backstop instead.
+            ///
+            /// `target_key` identifies what `redo` addresses. Every caller uses the raw
+            /// light_id (0-255) of the ONE physical bulb `redo` will individually re-address -
+            /// including a group dispatch's own retransmits (dynamic_group_command(),
+            /// FastconLight::write_state()'s group branch): the retry fallback for a group
+            /// always resolves to one schedule_retransmits() call per member, never one call
+            /// for the whole group, specifically so it is keyed by the bulb and not by
+            /// whichever group most recently addressed it. That is what makes "last command
+            /// wins, per bulb" hold even across two DIFFERENT group_ids that happen to share a
+            /// bulb, with no cross-group bookkeeping anywhere - group A's retransmit for a
+            /// shared bulb and group B's retransmit for that same bulb collide on the exact
+            /// same target_key and the later one simply wins, same as any other supersession
+            /// here. ANY existing pending retransmit(s) for the same target_key are cancelled
+            /// first: "any new state changes supersede any pending retransmits" (direct
+            /// request) - resending a stale value after the mesh has already been told
+            /// something new would fight the new command, not help it.
+            /// `redo` must capture everything it needs by VALUE (the group_id/light_id, mask,
+            /// light_data bytes, etc.) - it runs 1-5 seconds later, by which point any of this
+            /// object's own mutable state (this->members_, the light's current values) may have
+            /// moved on to something else entirely.
+            void schedule_retransmits(uint16_t target_key, std::function<void()> redo);
 
             void clear_queue();
             bool is_queue_empty() const
@@ -210,6 +243,17 @@ namespace esphome
             std::queue<Command> queue_;
             mutable std::mutex queue_mutex_;
             size_t max_queue_size_{100};
+
+            /// Pending +1s/+5s retransmits - see schedule_retransmits()'s own comment. Checked
+            /// and fired from loop(); a std::vector rather than a priority structure since
+            /// there are only ever a handful of these live at once (one dispatch = at most 2).
+            struct PendingRetransmit
+            {
+                uint16_t target_key;
+                uint32_t fire_at;
+                std::function<void()> redo;
+            };
+            std::vector<PendingRetransmit> pending_retransmits_;
 
             enum class AdvertiseState
             {

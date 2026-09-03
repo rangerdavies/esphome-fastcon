@@ -70,8 +70,43 @@ void FastconController::setup() {
   ESP_LOGCONFIG(TAG, "  Advertisement gap: %dms", this->adv_gap_);
 }
 
+void FastconController::schedule_retransmits(uint16_t target_key, std::function<void()> redo) {
+  // A fresh command for this target supersedes anything still pending for it - direct
+  // request: "any new state changes supersede any pending 'retransmits'". Resending a now-
+  // stale value after the mesh has already been told something new would fight the new
+  // command instead of reinforcing it.
+  this->pending_retransmits_.erase(
+      std::remove_if(this->pending_retransmits_.begin(), this->pending_retransmits_.end(),
+                      [target_key](const PendingRetransmit &p) { return p.target_key == target_key; }),
+      this->pending_retransmits_.end());
+
+  const uint32_t now = millis();
+  this->pending_retransmits_.push_back(PendingRetransmit{target_key, now + 1000, redo});
+  this->pending_retransmits_.push_back(PendingRetransmit{target_key, now + 5000, redo});
+}
+
 void FastconController::loop() {
   const uint32_t now = millis();
+
+  // Fire any due retransmits first. Each `redo` just re-runs a normal dispatch (queueCommand()
+  // and, for a group, ensure_group()), which is safe to call from here - it only ever queues,
+  // never blocks. Copy the due ones out before invoking any of them, since invoking one can
+  // itself call schedule_retransmits() again (nothing currently does, but a callback re-
+  // entering this same vector while it is being iterated would be a use-after-free waiting to
+  // happen).
+  if (!this->pending_retransmits_.empty()) {
+    std::vector<std::function<void()>> due;
+    for (auto it = this->pending_retransmits_.begin(); it != this->pending_retransmits_.end();) {
+      if (it->fire_at <= now) {
+        due.push_back(std::move(it->redo));
+        it = this->pending_retransmits_.erase(it);
+      } else {
+        ++it;
+      }
+    }
+    for (auto &fn : due) fn();
+  }
+
   switch (adv_state_) {
     case AdvertiseState::IDLE: {
       std::lock_guard<std::mutex> lock(queue_mutex_);
@@ -426,13 +461,6 @@ void FastconController::dynamic_group_command(uint8_t group_id, const std::vecto
     }
   }
 
-  // Same time-sync bracketing + ensure_group/group_control/queueCommand order as
-  // FastconLight::write_state()'s own group path - see that method's own comments
-  // (fastcon_light.cpp) for why. ensure_group() itself already no-ops on an empty mask
-  // (group 0's own case, per the guard above, and any group_id passed with no members).
-  this->send_time_sync();
-  this->ensure_group(group_id, mask);
-
   std::vector<uint8_t> light_data;
   if (!state) {
     light_data = {0x00};
@@ -442,25 +470,69 @@ void FastconController::dynamic_group_command(uint8_t group_id, const std::vecto
         blue, red, green, warm, cold,
     };
   }
-  auto payload = this->group_control(group_id, light_data);
-  this->queueCommand(group_id, payload);
-  this->send_time_sync();
 
-  // The group frame is on its way; now make the individual entities agree with it, so a
-  // reconciler sees per-light state rather than lights it believes are unchanged.
+  // Same time-sync bracketing + ensure_group/group_control/queueCommand order as
+  // FastconLight::write_state()'s own group path - see that method's own comments
+  // (fastcon_light.cpp) for why. ensure_group() itself already no-ops on an empty mask
+  // (group 0's own case, per the guard above, and any group_id passed with no members).
   //
-  // Group 0 is the hardwired all-lights group: it needs no membership write and it
-  // commands every bulb on the mesh, including any the caller did not list. Publishing
-  // only the listed members would leave the rest showing stale state while physically
-  // having changed - so publish onto every single-light entity instead, via the 0
-  // sentinel. This matters as soon as lights exist that the presets do not enumerate.
-  if (group_id == 0)
-    this->publish_group_members({0}, light_data);
-  else
-    this->publish_group_members(members, light_data);
+  // Captured by value, not by reference: this same lambda is also handed to
+  // schedule_retransmits() below and can run again 1-5 seconds from now, well after this
+  // call's own arguments have gone out of scope.
+  auto send_group = [this, group_id, mask, members, light_data, state, brightness]() {
+    this->send_time_sync();
+    this->ensure_group(group_id, mask);
+    auto payload = this->group_control(group_id, light_data);
+    this->queueCommand(group_id, payload);
+    this->send_time_sync();
 
-  ESP_LOGD(TAG, "Dynamic group command: group=%u members=%zu state=%d brightness=%u payload_len=%d",
-           (unsigned) group_id, members.size(), (int) state, (unsigned) brightness, (int) payload.size());
+    // The group frame is on its way; now make the individual entities agree with it, so a
+    // reconciler sees per-light state rather than lights it believes are unchanged.
+    //
+    // Group 0 is the hardwired all-lights group: it needs no membership write and it
+    // commands every bulb on the mesh, including any the caller did not list. Publishing
+    // only the listed members would leave the rest showing stale state while physically
+    // having changed - so publish onto every single-light entity instead, via the 0
+    // sentinel. This matters as soon as lights exist that the presets do not enumerate.
+    if (group_id == 0)
+      this->publish_group_members({0}, light_data);
+    else
+      this->publish_group_members(members, light_data);
+
+    ESP_LOGD(TAG, "Dynamic group command: group=%u members=%zu state=%d brightness=%u payload_len=%d",
+             (unsigned) group_id, members.size(), (int) state, (unsigned) brightness, (int) payload.size());
+  };
+
+  send_group();
+
+  // +1s/+5s retransmit fallback (confirmed sequence, direct request: group command issued
+  // -> group transmit -> 1s -> foreach(individual) transmit -> 5s -> foreach(individual)
+  // transmit): addresses each member INDIVIDUALLY instead of repeating the group command.
+  // Resending the same group command would have the same chance of failing again for the
+  // same reason if the original miss was a lost/evicted group membership (ensure_group()
+  // now always rewrites it, but that write is itself just another unacknowledged broadcast
+  // that can be missed) - single_control() addresses a bulb directly and needs no group
+  // membership at all, so it sidesteps that failure mode entirely rather than repeating it.
+  // No entity publish here - the group send above already published the correct values;
+  // this only concerns whether the bulbs themselves received them.
+  //
+  // Scheduled ONE PER MEMBER, keyed by that member's own light_id - deliberately NOT keyed
+  // by this group_id. This is what makes "last command wins, per bulb" correct even across
+  // two DIFFERENT group_ids that happen to share a bulb (e.g. group 50 then group 60,
+  // issued back to back, both including the same physical light): schedule_retransmits()
+  // already supersedes any existing entry with the same target_key, and here the
+  // target_key IS the physical bulb, not whichever group most recently addressed it - so a
+  // later command (group OR individual) naturally overwrites an earlier one's pending
+  // retransmit for a shared bulb, with no cross-group bookkeeping needed at all. A bulb
+  // that group 60 does NOT include keeps group 50's own still-pending retransmit
+  // untouched, which is correct too - nothing has told that bulb anything different since.
+  for (uint8_t id : members) {
+    this->schedule_retransmits((uint16_t) id, [this, id, light_data]() {
+      auto payload = this->single_control(id, light_data);
+      this->queueCommand(id, payload);
+      ESP_LOGD(TAG, "Retransmitting light %u individually", (unsigned) id);
+    });
+  }
 }
 
 void FastconController::send_time_sync() {

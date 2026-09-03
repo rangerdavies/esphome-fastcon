@@ -204,34 +204,79 @@ void FastconLight::write_state(light::LightState *state) {
     }
   }
 
-  // Wrap into the inner payload for this address
-  std::vector<uint8_t> payload;
+  // Wrap into the inner payload for this address. Captured by value in `send` below, not by
+  // reference: this same lambda is also handed to schedule_retransmits() and can run again
+  // 1-5 seconds from now, well after this call's own locals (and this->members_, which may
+  // have since been reassigned by a fresh fastcon.set_members call) are no longer what they
+  // were here.
+  FastconController *controller = this->controller_;
+  uint8_t light_id = this->light_id_;
+  std::vector<uint8_t> members = this->members_;
+  auto send_primary = [controller, is_group, addr, light_bytes, light_id, members]() {
+    std::vector<uint8_t> payload;
+    if (is_group) {
+      // The app is observed to send a cmd-9 time-sync frame right before and right after
+      // a group action - live A/B test of whether that primes the mesh into a more
+      // receptive state for the membership-write/group-control frames that follow. No-op
+      // if no time_id is configured on the controller.
+      controller->send_time_sync();
+
+      // Claim the slot before addressing it - unconditionally, every call (2026-09-03: these
+      // bulbs hold exactly one group assignment each, so a bulb shared with any OTHER group_id
+      // this controller has since addressed may already have been silently evicted from this
+      // one; see FastconController::ensure_group()'s own comment for the confirmed-live
+      // incident this fixed).
+      controller->ensure_group((uint8_t) addr, members);
+      payload = controller->group_control((uint8_t) addr, light_bytes);
+    } else {
+      payload = controller->single_control(light_id, light_bytes);
+    }
+
+    // Queue it for advertisement
+    controller->queueCommand(addr, payload);
+
+    if (is_group)
+      controller->send_time_sync();
+
+    ESP_LOGD(TAG, "Queued state v%s: %s=%u, payload_len=%d",
+             FASTCON_VERSION, is_group ? "group" : "light_id", addr, (int) payload.size());
+  };
+
+  send_primary();
+
   if (is_group) {
-    // The app is observed to send a cmd-9 time-sync frame right before and right after
-    // a group action - live A/B test of whether that primes the mesh into a more
-    // receptive state for the membership-write/group-control frames that follow. No-op
-    // if no time_id is configured on the controller.
-    this->controller_->send_time_sync();
+    // +1s/+5s retransmit fallback, per member individually rather than repeating the group
+    // command - see FastconController::dynamic_group_command()'s own comment on the
+    // identical choice (fastcon_controller.cpp) for the rationale: a lost/evicted group
+    // membership fails the group command the same way twice, but single_control() needs no
+    // membership at all. Unpack the bitmask (bit N of byte K addresses light_id 8K+N+1,
+    // same rule set_member_ids() packs it with) into individual ids once, up front, so the
+    // retransmit closure only ever needs to loop and send.
+    std::vector<uint8_t> member_ids;
+    for (size_t byte = 0; byte < members.size(); byte++)
+      for (int bit = 0; bit < 8; bit++)
+        if (members[byte] & (1 << bit))
+          member_ids.push_back((uint8_t) (byte * 8 + bit + 1));
 
-    // Claim the slot before addressing it - unconditionally, every call (2026-09-03: these
-    // bulbs hold exactly one group assignment each, so a bulb shared with any OTHER group_id
-    // this controller has since addressed may already have been silently evicted from this
-    // one; see FastconController::ensure_group()'s own comment for the confirmed-live
-    // incident this fixed).
-    this->controller_->ensure_group((uint8_t) addr, this->members_);
-    payload = this->controller_->group_control((uint8_t) addr, light_bytes);
+    // Scheduled ONE PER MEMBER, keyed by that member's own light_id - deliberately NOT
+    // keyed by this group's own addr. See FastconController::dynamic_group_command()'s own
+    // comment on the identical choice (fastcon_controller.cpp) for why: this is what makes
+    // "last command wins, per bulb" correct even across two different groups (static or
+    // dynamic) that happen to share a bulb, with no cross-group bookkeeping needed - a
+    // later command for a shared bulb naturally supersedes an earlier one's pending
+    // retransmit for it, because schedule_retransmits() keys on the physical bulb, not on
+    // whichever group most recently addressed it.
+    for (uint8_t id : member_ids) {
+      controller->schedule_retransmits((uint16_t) id, [controller, id, light_bytes]() {
+        auto payload = controller->single_control(id, light_bytes);
+        controller->queueCommand(id, payload);
+        ESP_LOGD(TAG, "Retransmitting light %u individually", (unsigned) id);
+      });
+    }
   } else {
-    payload = this->controller_->single_control(this->light_id_, light_bytes);
+    // No group involved - the retransmit fallback IS the same single-light command.
+    controller->schedule_retransmits((uint16_t) addr, send_primary);
   }
-
-  // Queue it for advertisement
-  this->controller_->queueCommand(addr, payload);
-
-  if (is_group)
-    this->controller_->send_time_sync();
-
-  ESP_LOGD(TAG, "Queued state v%s: %s=%u, payload_len=%d",
-           FASTCON_VERSION, is_group ? "group" : "light_id", addr, (int)payload.size());
 }
 
 }  // namespace fastcon
