@@ -33,10 +33,9 @@ class FastconLight : public Component, public light::LightOutput {
   void set_color_interlock(bool v) { color_interlock_ = v; }
   void set_mode(FastconAddressMode m) { mode_ = m; }
 
-  /// Compile-time membership: a pre-packed bitmask straight from the YAML.
-  void set_members(const std::vector<uint8_t> &mask) { members_ = mask; }
-
-  /// Runtime membership: a list of mesh light ids, packed here and applied at once.
+  /// Membership: a list of mesh light ids, packed here and applied at once. This is the
+  /// only way to set it - the entity declares itself a group in YAML but never its
+  /// members, which arrive from Home Assistant via the fastcon.set_members action.
   /// Ids outside 1..255 are skipped with a warning. An empty list leaves the group
   /// undefined, which makes the entity a no-op rather than addressing a stale set.
   void set_member_ids(const std::vector<int32_t> &ids);
