@@ -145,7 +145,9 @@ namespace esphome
             int observed_group_of(uint8_t light_id) const;
 
 #ifdef USE_ESP32_BLE_TRACKER
-            bool parse_device(const esp32_ble_tracker::ESPBTDevice &device) override;
+            // ble_device_base::ESPBTDevice, not esp32_ble_tracker::ESPBTDevice - the latter is only
+            // a `using` alias, and only exists when USE_ESP32_BLE_DEVICE happens to be defined.
+            bool parse_device(const ble_device_base::ESPBTDevice &device) override;
 #endif
 
         protected:
