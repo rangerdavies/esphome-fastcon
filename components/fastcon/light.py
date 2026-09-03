@@ -86,6 +86,9 @@ SetMembersAction = fastcon_ns.class_("SetMembersAction", automation.Action)
             ),
         }
     ),
+    # play() packs the mask and re-applies state inline, so play_next_() always runs
+    # before play_complex() returns. Nothing is deferred to a timer, callback or loop().
+    synchronous=True,
 )
 async def set_members_action_to_code(config, action_id, template_arg, args):
     parent = await cg.get_variable(config[CONF_ID])
