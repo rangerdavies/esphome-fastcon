@@ -26,31 +26,73 @@ namespace fastcon {
 
 static const char *const TAG = "fastcon.controller";
 
-void FastconController::queueCommand(uint32_t light_id_, const std::vector<uint8_t> &data, uint8_t repeat) {
+void FastconController::queueCommand(uint32_t light_id_, const std::vector<uint8_t> &data, uint8_t repeat,
+                                       bool is_group, const std::vector<uint8_t> &group_mask) {
   if (repeat == 0)
     repeat = this->command_retries_;
 
   std::lock_guard<std::mutex> lock(queue_mutex_);
 
-  // Supersede stale queued frames for this same target (2026-09-07) - closes a backlog
-  // window a live queue-depth diagnostic caught directly: a burst of competing dispatches
-  // (confirmed live during the post-reflash reboot-recovery mode-cycling storm, but the
-  // same thing can happen from any sufficiently dense run of triggers) can queue many
-  // SECONDS of frames for the same bulb across different, now-obsolete looks before any
-  // of them actually transmit - the bulb then dutifully plays back every stale one in
+  // Supersede stale queued frames this dispatch makes obsolete (2026-09-07) - closes a
+  // backlog window a live queue-depth diagnostic caught directly: a burst of competing
+  // dispatches (confirmed live during the post-reflash reboot-recovery mode-cycling storm,
+  // but the same thing can happen from any sufficiently dense run of triggers) can queue
+  // many SECONDS of frames for the same bulb across different, now-obsolete looks before
+  // any of them actually transmit - the bulb then dutifully plays back every stale one in
   // sequence, visible as real, multi-step physical flicker well after HA already believes
-  // the final look is applied. A fresh command for a target means every not-yet-sent frame
-  // already queued for that SAME target is now obsolete - only the newest one reflects
-  // what should actually go out. Only removes frames still WAITING in queue_; a frame
-  // already popped into the active advertise/gap cycle in loop() is untouched, matching
-  // "don't touch what's already irrevocably started, only supersede what hasn't gone out
-  // yet". Settle pauses (target 0, no target of their own) are deliberately left alone -
-  // an orphaned one just adds a harmless short gap, nothing protocol-breaking; see
-  // TIME_SYNC_TARGET's own header comment for why light_id_/group_id 0 specifically still
-  // needs its own carve-out despite this.
+  // the final look is applied. Only removes frames still WAITING in queue_; a frame already
+  // popped into the active advertise/gap cycle in loop() is untouched, matching "don't touch
+  // what's already irrevocably started, only supersede what hasn't gone out yet". Settle
+  // pauses (data empty, no target of their own) are deliberately left alone - an orphaned
+  // one just adds a harmless short gap, nothing protocol-breaking; see TIME_SYNC_TARGET's
+  // own header comment for why light_id_/group_id 0 specifically still needs its own
+  // carve-out despite this.
+  //
+  // Three rules, per direct request (2026-09-07):
+  //  1. Exact same target (same light_id vs same light_id, or same group_id vs same
+  //     group_id) - unconditional, as before.
+  //  2. A fresh GROUP dispatch supersedes a queued INDIVIDUAL command for one of ITS OWN
+  //     members. The reverse never happens - an incoming individual command never
+  //     supersedes a queued group command, even for a member of that group - since
+  //     discarding a queued individual command never drops state for any other light.
+  //  3. A fresh GROUP dispatch supersedes a queued command for a DIFFERENT group_id only
+  //     when this group's membership fully COVERS the queued group's (a strict superset or
+  //     equal set) - never on a partial/unrelated overlap. A partial overlap is left alone:
+  //     discarding it would drop the queued group's effect on whichever of its members
+  //     aren't also in the new group, which nothing here would ever re-address.
   size_t superseded = 0;
   for (auto it = this->queue_.begin(); it != this->queue_.end();) {
-    if (!it->data.empty() && it->target == light_id_) {
+    bool erase = false;
+    if (!it->data.empty()) {
+      if (it->target == light_id_) {
+        erase = true;  // rule 1
+      } else if (is_group && !it->is_group) {
+        // rule 2
+        if (light_id_ == 0) {
+          erase = true;  // group 0 ("all lights") includes every bulb
+        } else if (!group_mask.empty() && it->target >= 1) {
+          const size_t byte = (size_t) (it->target - 1) / 8;
+          if (byte < group_mask.size() && (group_mask[byte] & (1 << ((it->target - 1) % 8))))
+            erase = true;
+        }
+      } else if (is_group && it->is_group) {
+        // rule 3
+        if (light_id_ == 0 && it->target != 0) {
+          erase = true;  // group 0 is a superset of every other group by definition
+        } else if (light_id_ != 0 && it->target != 0 && !group_mask.empty() && !it->group_mask.empty()) {
+          bool superset = true;
+          for (size_t byte = 0; byte < it->group_mask.size() && superset; byte++) {
+            const uint8_t theirs = it->group_mask[byte];
+            const uint8_t ours = byte < group_mask.size() ? group_mask[byte] : 0;
+            if ((theirs & ours) != theirs)
+              superset = false;
+          }
+          if (superset)
+            erase = true;
+        }
+      }
+    }
+    if (erase) {
       it = this->queue_.erase(it);
       superseded++;
     } else {
@@ -70,6 +112,8 @@ void FastconController::queueCommand(uint32_t light_id_, const std::vector<uint8
     Command cmd;
     cmd.data = data;
     cmd.target = light_id_;
+    cmd.is_group = is_group;
+    cmd.group_mask = group_mask;
     cmd.timestamp = millis();
     cmd.retries = 0;
     queue_.push_back(cmd);
@@ -521,7 +565,7 @@ void FastconController::ensure_group(uint8_t group_id, const std::vector<uint8_t
   this->queue_settle(this->group_settle_ms_);
   // Pass the membership retry count explicitly: queueCommand defaults to
   // command_retries_, and letting both apply would send this nine times.
-  this->queueCommand(group_id, adv_data, this->membership_retries_);
+  this->queueCommand(group_id, adv_data, this->membership_retries_, /*is_group=*/true, /*group_mask=*/mask);
   this->queue_settle(this->group_settle_ms_);
 
   this->group_masks_[group_id] = GroupState{mask, millis()};
@@ -598,7 +642,7 @@ void FastconController::dynamic_group_command(uint8_t group_id, const std::vecto
     this->send_time_sync();
     this->ensure_group(group_id, mask);
     auto payload = this->group_control(group_id, light_data);
-    this->queueCommand(group_id, payload);
+    this->queueCommand(group_id, payload, /*repeat=*/0, /*is_group=*/true, /*group_mask=*/mask);
     this->send_time_sync();
 
     // The group frame is on its way; now make the individual entities agree with it, so a

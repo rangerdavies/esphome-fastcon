@@ -241,8 +241,10 @@ void FastconLight::write_state(light::LightState *state) {
       payload = controller->single_control(light_id, light_bytes);
     }
 
-    // Queue it for advertisement
-    controller->queueCommand(addr, payload);
+    // Queue it for advertisement. `members` is this entity's own membership bitmask -
+    // empty for an individual entity, which is exactly when is_group is also false, so
+    // this is equivalent to the old unconditional call in that case.
+    controller->queueCommand(addr, payload, /*repeat=*/0, is_group, members);
 
     if (is_group)
       controller->send_time_sync();

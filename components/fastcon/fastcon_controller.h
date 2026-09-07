@@ -84,7 +84,24 @@ namespace esphome
             /// protocol is roughly 80%% per advertisement, so a single shot loses a bulb about
             /// one time in five - which is why every working implementation of it repeats.
             /// Defaults to command_retries_ when not given; ensure_group() passes its own.
-            void queueCommand(uint32_t light_id_, const std::vector<uint8_t> &data, uint8_t repeat = 0);
+            ///
+            /// `is_group`/`group_mask` (2026-09-07) mark this dispatch as addressing a group
+            /// rather than a single light, and give that group's current membership bitmask
+            /// (same bit-packing as FastconLight::set_member_ids()/group_masks_: bit
+            /// `(id-1)%8` of byte `(id-1)/8`) - used to decide which OTHER still-queued
+            /// entries this dispatch makes stale, beyond the exact-same-target case. A group
+            /// dispatch supersedes a queued INDIVIDUAL command for one of its own members, and
+            /// a queued DIFFERENT group_id's command only when this group's membership fully
+            /// covers it (so nothing the queued frame would have addressed is left
+            /// unaddressed) - never the reverse, and never a partial/unrelated overlap. See
+            /// the supersede loop's own comment (fastcon_controller.cpp) for the exact rules.
+            /// Leave `group_mask` empty for `group_id == 0` (the firmware "all lights" group,
+            /// which never gets an explicit membership list) - `light_id_ == 0` alone is
+            /// enough to mean "every light is a member." Leave both at their defaults for an
+            /// individual dispatch, and for a non-zero group_id whose membership isn't known
+            /// yet (that intentionally performs no cross-supersede rather than guessing).
+            void queueCommand(uint32_t light_id_, const std::vector<uint8_t> &data, uint8_t repeat = 0,
+                               bool is_group = false, const std::vector<uint8_t> &group_mask = {});
 
             /// Queue a pause. Nothing is advertised; the queue simply idles, giving the bulbs
             /// time to act on what came before it.
@@ -243,6 +260,23 @@ namespace esphome
                 /// why this exists and TIME_SYNC_TARGET below for the one deliberate
                 /// exception.
                 uint32_t target{0};
+
+                /// True when `target` is a group_id (this dispatch addresses every member of
+                /// that group at once), false when it is a single light_id. Lets a fresh group
+                /// dispatch's own supersede pass (queueCommand(), fastcon_controller.cpp) tell
+                /// a queued GROUP command apart from a queued INDIVIDUAL one that happens to
+                /// share the same numeric target space, so it only ever removes a queued
+                /// individual command for one of its own members, or a queued different
+                /// group's command it fully covers - never mistakes one for the other.
+                bool is_group{false};
+
+                /// This group's membership bitmask at the time it was queued (empty for an
+                /// individual command, and empty by convention for group_id 0 - see
+                /// TIME_SYNC_TARGET's neighboring comment). Same bit-packing as
+                /// FastconLight::set_member_ids()/group_masks_. Kept only so a LATER, different
+                /// group_id's dispatch can tell whether it fully covers this queued group's
+                /// members (see queueCommand()'s own comment) - never read for anything else.
+                std::vector<uint8_t> group_mask;
             };
 
             /// std::deque, not std::queue (2026-09-07, was std::queue<Command>) - queueCommand()
