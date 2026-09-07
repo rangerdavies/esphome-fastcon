@@ -244,6 +244,32 @@ namespace esphome
             mutable std::mutex queue_mutex_;
             size_t max_queue_size_{100};
 
+            /// Diagnostics (2026-09-07) - added while chasing physical bulb flicker that left
+            /// no trace in the existing dispatch/observed logging. Two things this can't rule
+            /// out on its own but can at least make visible: (1) a queued frame sitting far
+            /// longer than its own log line implies, if dispatches stack faster than the
+            /// adv_duration_/adv_gap_ duty cycle drains them - see log_heartbeat_()'s own
+            /// comment; (2) a generally noisy RF environment (see drop_no_marker_/
+            /// drop_mesh_key_mismatch_/drop_checksum_ below) that's at least consistent with
+            /// physical-layer flicker, even though it can't prove any single bulb's own
+            /// reception was affected - see handle_sniffed_payload_()'s own comment on why
+            /// that gap can never fully close from this side of the radio.
+            uint32_t last_heartbeat_ms_{0};
+            static const uint32_t HEARTBEAT_INTERVAL_MS = 60000;
+            uint32_t drop_no_marker_{0};
+            uint32_t drop_mesh_key_mismatch_{0};
+            uint32_t drop_checksum_{0};
+
+            /// Periodic (HEARTBEAT_INTERVAL_MS) log of uptime, free heap, the reset reason
+            /// (read fresh each time via esp_reset_reason() - it reports the same answer for
+            /// the device's whole current run, nothing to cache), and the drop counters above -
+            /// called from loop(), gated by its own timer so it doesn't spam every iteration.
+            /// A silent brief reboot mid-session
+            /// (confirmed to happen at least once already, from something as small as a USB
+            /// reconnect) is otherwise only visible by noticing a boot banner in the log by
+            /// eye; this makes it impossible to miss.
+            void log_heartbeat_();
+
             /// Pending +1s/+5s retransmits - see schedule_retransmits()'s own comment. Checked
             /// and fired from loop(); a std::vector rather than a priority structure since
             /// there are only ever a handful of these live at once (one dispatch = at most 2).

@@ -55,6 +55,12 @@ class FastconLight : public Component, public light::LightOutput {
   /// `is_group` is false, otherwise a group id.
   void apply_observed(bool is_group, uint8_t addr, const std::vector<uint8_t> &light_data);
 
+  /// True if this is a single-light entity (not a group) whose own mesh light_id is
+  /// `id`. Used by the controller's membership-hijack alert (2026-09-07) to check a
+  /// sniffed group-assignment frame against our own registered lights without exposing
+  /// light_id_/mode_ themselves - those stay protected.
+  bool owns_mesh_id(uint8_t id) const { return this->mode_ == FASTCON_SINGLE && this->light_id_ == id; }
+
   // LightOutput interface
   light::LightTraits get_traits() override;
   void write_state(light::LightState *state) override;

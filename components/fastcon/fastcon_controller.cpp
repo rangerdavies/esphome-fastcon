@@ -3,6 +3,7 @@
 #include "esphome/core/log.h"
 #include "esphome/core/helpers.h"
 #include <algorithm>
+#include "esp_system.h"
 #include "esphome/components/light/color_mode.h"
 #include "esphome/components/light/light_state.h"
 // USE_TIME is only defined (and esphome/components/time/*'s sources only added to the
@@ -70,6 +71,40 @@ void FastconController::setup() {
   ESP_LOGCONFIG(TAG, "  Advertisement gap: %dms", this->adv_gap_);
 }
 
+// esp_reset_reason() names, for the heartbeat log below - esp_err_to_name()-style helper
+// doesn't exist for this enum, and the numeric value alone means nothing without the
+// ESP-IDF header open next to it.
+static const char *reset_reason_name(esp_reset_reason_t r) {
+  switch (r) {
+    case ESP_RST_UNKNOWN: return "UNKNOWN";
+    case ESP_RST_POWERON: return "POWERON";
+    case ESP_RST_EXT: return "EXT";
+    case ESP_RST_SW: return "SW";
+    case ESP_RST_PANIC: return "PANIC";
+    case ESP_RST_INT_WDT: return "INT_WDT";
+    case ESP_RST_TASK_WDT: return "TASK_WDT";
+    case ESP_RST_WDT: return "WDT";
+    case ESP_RST_DEEPSLEEP: return "DEEPSLEEP";
+    case ESP_RST_BROWNOUT: return "BROWNOUT";
+    case ESP_RST_SDIO: return "SDIO";
+    default: return "?";
+  }
+}
+
+void FastconController::log_heartbeat_() {
+  // Low-frequency, deliberately cheap - just a visibility floor so a silent reboot or a
+  // resource squeeze mid-session shows up on its own timer instead of requiring a human
+  // to notice a boot banner by eye while scanning a long log. esp_reset_reason() reads a
+  // register set once at boot and is safe to call repeatedly - it reports the SAME reason
+  // for the device's current run every time, not "what just happened".
+  ESP_LOGI(TAG, "Heartbeat: uptime=%us free_heap=%u reset_reason=%s queue_size=%zu "
+                "pending_retransmits=%zu sniff_drops(no_marker=%u mesh_key=%u checksum=%u)",
+           (unsigned) (millis() / 1000), (unsigned) esp_get_free_heap_size(),
+           reset_reason_name(esp_reset_reason()), this->get_queue_size(),
+           this->pending_retransmits_.size(), (unsigned) this->drop_no_marker_,
+           (unsigned) this->drop_mesh_key_mismatch_, (unsigned) this->drop_checksum_);
+}
+
 void FastconController::schedule_retransmits(uint16_t target_key, std::function<void()> redo) {
   // A fresh command for this target supersedes anything still pending for it - direct
   // request: "any new state changes supersede any pending 'retransmits'". Resending a now-
@@ -87,6 +122,11 @@ void FastconController::schedule_retransmits(uint16_t target_key, std::function<
 
 void FastconController::loop() {
   const uint32_t now = millis();
+
+  if (now - this->last_heartbeat_ms_ >= HEARTBEAT_INTERVAL_MS) {
+    this->last_heartbeat_ms_ = now;
+    this->log_heartbeat_();
+  }
 
   // Fire any due retransmits first. Each `redo` just re-runs a normal dispatch (queueCommand()
   // and, for a group, ensure_group()), which is safe to call from here - it only ever queues,
@@ -519,6 +559,12 @@ void FastconController::dynamic_group_command(uint8_t group_id, const std::vecto
   // schedule_retransmits() below and can run again 1-5 seconds from now, well after this
   // call's own arguments have gone out of scope.
   auto send_group = [this, group_id, mask, members, light_data, state, brightness]() {
+    // Queue depth BEFORE this dispatch's own frames go in (2026-09-07) - reveals a
+    // backlog this dispatch is landing behind, not just what it adds. See this file's
+    // own header note on last_heartbeat_ms_/log_heartbeat_() for why: at 150ms/frame
+    // (adv_duration_+adv_gap_), a queue that's already deep when a new dispatch starts
+    // means its own frames sit far longer than this log line's own timestamp implies.
+    const size_t queue_size_before = this->get_queue_size();
     this->send_time_sync();
     this->ensure_group(group_id, mask);
     auto payload = this->group_control(group_id, light_data);
@@ -538,8 +584,10 @@ void FastconController::dynamic_group_command(uint8_t group_id, const std::vecto
     else
       this->publish_group_members(members, light_data);
 
-    ESP_LOGD(TAG, "Dynamic group command: group=%u members=%zu state=%d brightness=%u payload_len=%d",
-             (unsigned) group_id, members.size(), (int) state, (unsigned) brightness, (int) payload.size());
+    ESP_LOGD(TAG, "Dynamic group command: group=%u members=%zu state=%d brightness=%u payload_len=%d "
+                  "queue_before=%zu queue_after=%zu",
+             (unsigned) group_id, members.size(), (int) state, (unsigned) brightness, (int) payload.size(),
+             queue_size_before, this->get_queue_size());
   };
 
   send_group();
@@ -755,6 +803,7 @@ void FastconController::handle_sniffed_payload_(const std::vector<uint8_t> &payl
     body.assign(pre.begin() + 6, pre.end() - 2);
     framing = "control";
   } else {
+    this->drop_no_marker_++;
     ESP_LOGD(TAG, "SNIFF drop no framing marker (want a55a or 8ef0aa, got %02x%02x%02x, len %u)",
              pre.size() > 0 ? pre[0] : 0, pre.size() > 1 ? pre[1] : 0, pre.size() > 2 ? pre[2] : 0,
              (unsigned) pre.size());
@@ -762,6 +811,7 @@ void FastconController::handle_sniffed_payload_(const std::vector<uint8_t> &payl
   }
 
   if (body.size() < 5) {
+    this->drop_no_marker_++;
     ESP_LOGD(TAG, "SNIFF drop %s body too short (%u bytes)", framing, (unsigned) body.size());
     return;
   }
@@ -777,6 +827,7 @@ void FastconController::handle_sniffed_payload_(const std::vector<uint8_t> &payl
   // Two independent checks that this decoded cleanly and belongs to our mesh. A frame
   // from a neighbour's mesh decrypts to noise and fails both.
   if (body[2] != this->mesh_key_[3]) {
+    this->drop_mesh_key_mismatch_++;
     ESP_LOGD(TAG, "SNIFF drop mesh key mismatch (body[2]=%02x, ours=%02x)", body[2],
              this->mesh_key_[3]);
     return;
@@ -787,6 +838,7 @@ void FastconController::handle_sniffed_payload_(const std::vector<uint8_t> &payl
       sum += body[i];
   }
   if (sum != body[3]) {
+    this->drop_checksum_++;
     ESP_LOGD(TAG, "SNIFF drop checksum %02x != %02x", sum, body[3]);
     return;
   }
@@ -837,6 +889,26 @@ void FastconController::dispatch_observed_(const std::vector<uint8_t> &inner) {
   if (cmd == 1 && inner.size() >= 3) {
     // Group assignment. Not a state change in itself, but it records which group a bulb
     // is in, which is what lets a sniffed group command reach individual entities.
+    //
+    // Membership-hijack alert (2026-09-07, added while chasing physical bulb flicker
+    // that left no other trace): if this is one of OUR registered lights (not some
+    // other bulb entirely) and its observed group is changing to something other than
+    // what we last saw, log it at WARN - a bulb's own membership assignment changing
+    // out from under us, from a source other than our own last write, is exactly the
+    // shared-group-id hijack scripts.yaml's own state-management gate was fixed for
+    // (see apply_living_room_light_targets's "Shared-group override" comment) - this
+    // makes it visible in real time instead of requiring after-the-fact log
+    // reconstruction like the Day Light incident that fix was built from.
+    auto prior = this->observed_light_group_.find(inner[1]);
+    if (prior != this->observed_light_group_.end() && prior->second != inner[2]) {
+      for (auto *l : this->lights_) {
+        if (l->owns_mesh_id(inner[1])) {
+          ESP_LOGW(TAG, "Membership change: light %u moved from group %u to group %u",
+                   (unsigned) inner[1], (unsigned) prior->second, (unsigned) inner[2]);
+          break;
+        }
+      }
+    }
     this->observed_light_group_[inner[1]] = inner[2];
     ESP_LOGD(TAG, "Observed: light %u assigned to group %u", (unsigned) inner[1], (unsigned) inner[2]);
     return;

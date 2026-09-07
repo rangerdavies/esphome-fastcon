@@ -218,6 +218,10 @@ void FastconLight::write_state(light::LightState *state) {
   uint8_t light_id = this->light_id_;
   std::vector<uint8_t> members = this->members_;
   auto send_primary = [controller, is_group, addr, light_bytes, light_id, members]() {
+    // Queue depth before this dispatch's own frames go in - see
+    // FastconController::dynamic_group_command()'s own comment (fastcon_controller.cpp)
+    // for why this matters more than it looks like it should.
+    const size_t queue_size_before = controller->get_queue_size();
     std::vector<uint8_t> payload;
     if (is_group) {
       // The app is observed to send a cmd-9 time-sync frame right before and right after
@@ -243,8 +247,9 @@ void FastconLight::write_state(light::LightState *state) {
     if (is_group)
       controller->send_time_sync();
 
-    ESP_LOGD(TAG, "Queued state v%s: %s=%u, payload_len=%d",
-             FASTCON_VERSION, is_group ? "group" : "light_id", addr, (int) payload.size());
+    ESP_LOGD(TAG, "Queued state v%s: %s=%u, payload_len=%d queue_before=%zu queue_after=%zu",
+             FASTCON_VERSION, is_group ? "group" : "light_id", addr, (int) payload.size(),
+             queue_size_before, controller->get_queue_size());
   };
 
   send_primary();
