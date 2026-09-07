@@ -31,6 +31,36 @@ void FastconController::queueCommand(uint32_t light_id_, const std::vector<uint8
     repeat = this->command_retries_;
 
   std::lock_guard<std::mutex> lock(queue_mutex_);
+
+  // Supersede stale queued frames for this same target (2026-09-07) - closes a backlog
+  // window a live queue-depth diagnostic caught directly: a burst of competing dispatches
+  // (confirmed live during the post-reflash reboot-recovery mode-cycling storm, but the
+  // same thing can happen from any sufficiently dense run of triggers) can queue many
+  // SECONDS of frames for the same bulb across different, now-obsolete looks before any
+  // of them actually transmit - the bulb then dutifully plays back every stale one in
+  // sequence, visible as real, multi-step physical flicker well after HA already believes
+  // the final look is applied. A fresh command for a target means every not-yet-sent frame
+  // already queued for that SAME target is now obsolete - only the newest one reflects
+  // what should actually go out. Only removes frames still WAITING in queue_; a frame
+  // already popped into the active advertise/gap cycle in loop() is untouched, matching
+  // "don't touch what's already irrevocably started, only supersede what hasn't gone out
+  // yet". Settle pauses (target 0, no target of their own) are deliberately left alone -
+  // an orphaned one just adds a harmless short gap, nothing protocol-breaking; see
+  // TIME_SYNC_TARGET's own header comment for why light_id_/group_id 0 specifically still
+  // needs its own carve-out despite this.
+  size_t superseded = 0;
+  for (auto it = this->queue_.begin(); it != this->queue_.end();) {
+    if (!it->data.empty() && it->target == light_id_) {
+      it = this->queue_.erase(it);
+      superseded++;
+    } else {
+      ++it;
+    }
+  }
+  if (superseded > 0) {
+    ESP_LOGD(TAG, "Superseded %zu stale queued frame(s) for target %u", superseded, (unsigned) light_id_);
+  }
+
   for (uint8_t i = 0; i < repeat; i++) {
     if (queue_.size() >= max_queue_size_) {
       ESP_LOGW(TAG, "Command queue full (size=%d), dropping command for light %d (sent %d of %d)",
@@ -39,9 +69,10 @@ void FastconController::queueCommand(uint32_t light_id_, const std::vector<uint8
     }
     Command cmd;
     cmd.data = data;
+    cmd.target = light_id_;
     cmd.timestamp = millis();
     cmd.retries = 0;
-    queue_.push(cmd);
+    queue_.push_back(cmd);
   }
   ESP_LOGV(TAG, "Command queued x%d, queue size: %d", (int)repeat, (int)queue_.size());
 }
@@ -55,13 +86,12 @@ void FastconController::queue_settle(uint16_t ms) {
   Command cmd;
   cmd.settle_ms = ms;  // data stays empty - that is what marks it a pause
   cmd.timestamp = millis();
-  queue_.push(cmd);
+  queue_.push_back(cmd);
 }
 
 void FastconController::clear_queue() {
   std::lock_guard<std::mutex> lock(queue_mutex_);
-  std::queue<Command> empty;
-  std::swap(queue_, empty);
+  this->queue_.clear();
 }
 
 void FastconController::setup() {
@@ -152,7 +182,7 @@ void FastconController::loop() {
       std::lock_guard<std::mutex> lock(queue_mutex_);
       if (queue_.empty()) return;
       Command cmd = queue_.front();
-      queue_.pop();
+      queue_.pop_front();
 
       // A settling pause carries no frame: idle through the gap state instead of
       // advertising, so the bulbs get time to act on what was already sent.
@@ -658,7 +688,7 @@ void FastconController::send_time_sync() {
   // Once, not command_retries_ times: this carries no state worth re-asserting, and it is
   // already queued twice around every group action.
   this->note_sent_(data);
-  this->queueCommand(0, this->generate_command(5, 0, data, true), 1);
+  this->queueCommand(TIME_SYNC_TARGET, this->generate_command(5, 0, data, true), 1);
 #else
   // No `time:` platform anywhere in this build, so time_id could never have been set
   // (its schema requires cv.use_id(time.RealTimeClock)) - time_source_ is always null.

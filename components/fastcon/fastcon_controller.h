@@ -1,6 +1,5 @@
 #pragma once
 
-#include <queue>
 #include <deque>
 #include <functional>
 #include <map>
@@ -238,11 +237,33 @@ namespace esphome
                 uint32_t timestamp;
                 uint8_t retries{0};
                 static constexpr uint8_t MAX_RETRIES = 3;
+                /// Same numeric space as schedule_retransmits()'s own target_key (a raw
+                /// light_id or group_id) - 0 for a settling pause, which has no target of
+                /// its own. See queueCommand()'s own comment (fastcon_controller.cpp) for
+                /// why this exists and TIME_SYNC_TARGET below for the one deliberate
+                /// exception.
+                uint32_t target{0};
             };
 
-            std::queue<Command> queue_;
+            /// std::deque, not std::queue (2026-09-07, was std::queue<Command>) - queueCommand()
+            /// needs to walk and erase mid-queue entries for the supersession logic below;
+            /// std::queue is a strict FIFO adapter with no iteration. front()/pop_front()/
+            /// push_back() replace queue()'s front()/pop()/push() at every call site; empty()/
+            /// size() are unchanged.
+            std::deque<Command> queue_;
             mutable std::mutex queue_mutex_;
             size_t max_queue_size_{100};
+
+            /// Deliberately outside the valid 0-255 light_id/group_id range (2026-09-07) -
+            /// send_time_sync()'s own queued frame used to share target 0 with "group 0"
+            /// (the firmware-owned all-lights broadcast), which meant the supersession logic
+            /// below would wipe out a real, still-pending group-0 light command because a
+            /// bracketing time-sync frame for the SAME dispatch happened to queue right next
+            /// to it under the same target. A time-sync frame carries no light state and
+            /// should never compete with, or be susceptible to, a light command's own
+            /// supersession - giving it a target no real light_id/group_id can ever reach
+            /// closes that off entirely rather than special-casing it in the scan itself.
+            static const uint32_t TIME_SYNC_TARGET = 0x100;
 
             /// Diagnostics (2026-09-07) - added while chasing physical bulb flicker that left
             /// no trace in the existing dispatch/observed logging. Two things this can't rule
