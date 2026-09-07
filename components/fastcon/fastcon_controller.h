@@ -248,6 +248,13 @@ namespace esphome
             /// (see ensure_group()'s own comment), so flipping this back to true later resumes
             /// skipping from whatever the cache currently holds.
             void set_skip_tracked_membership(bool b) { skip_tracked_membership_ = b; }
+            /// Pause inserted between each repeat of a membership write within the same
+            /// dispatch (2026-09-07, per direct request "can i increase the resend time
+            /// between the 3x membership writes?") - 0 (default) preserves the old back-to-
+            /// back-at-the-adv-duty-cycle behavior (no explicit gap beyond the ~60ms/frame
+            /// adv_duration_+adv_gap_ cadence). Only paces GROUP_MEMBERSHIP repeats, not
+            /// GROUP_CONTROL/INDIVIDUAL ones - see queueCommand()'s own comment.
+            void set_membership_repeat_gap(uint16_t ms) { membership_repeat_gap_ms_ = ms; }
             /// No longer affects behavior (2026-09-03) - ensure_group() rewrites membership
             /// unconditionally on every call now, see its own header comment. Kept only so the
             /// `fastcon: membership_ttl:` YAML option (fastcon_controller.py) still compiles for
@@ -497,6 +504,8 @@ namespace esphome
             std::vector<uint32_t> retransmit_delays_{1000, 5000};
             /// See set_skip_tracked_membership()'s own comment.
             bool skip_tracked_membership_{true};
+            /// See set_membership_repeat_gap()'s own comment.
+            uint16_t membership_repeat_gap_ms_{0};
             uint32_t membership_ttl_{30000};  // unused - see set_membership_ttl()'s own comment
             uint8_t group_slot_{0xfd};
 

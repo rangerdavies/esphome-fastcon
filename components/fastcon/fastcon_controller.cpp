@@ -153,6 +153,20 @@ void FastconController::queueCommand(uint32_t light_id_, const std::vector<uint8
     cmd.timestamp = millis();
     cmd.retries = 0;
     queue_.push_back(cmd);
+
+    // Configurable pause between repeats of a membership write (2026-09-07, per direct
+    // request "can i increase the resend time between the 3x membership writes?") - only
+    // between repeats (not after the last one), and only for GROUP_MEMBERSHIP, not every
+    // repeated command generically. Pushed as an inline settle entry rather than calling
+    // queue_settle() - that method takes queue_mutex_ itself, which is already held here.
+    if (kind == CommandKind::GROUP_MEMBERSHIP && membership_repeat_gap_ms_ > 0 && i + 1 < repeat) {
+      if (queue_.size() >= max_queue_size_)
+        break;
+      Command pause;
+      pause.settle_ms = membership_repeat_gap_ms_;  // data stays empty - marks it a pause
+      pause.timestamp = millis();
+      queue_.push_back(pause);
+    }
   }
   ESP_LOGV(TAG, "Command queued x%d, queue size: %d", (int)repeat, (int)queue_.size());
 }
