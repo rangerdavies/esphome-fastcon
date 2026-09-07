@@ -338,6 +338,26 @@ namespace esphome
             void handle_sniffed_payload_(const std::vector<uint8_t> &payload);
             void dispatch_observed_(const std::vector<uint8_t> &inner);
 
+            /// A bulb's own status broadcast, already mesh-key-decoded by the caller.
+            ///
+            /// This is the only bulb->controller signal in the protocol (found 2026-09-07 in a
+            /// phone capture of an app group being created: each `21 <light_id> <group_id>`
+            /// assignment was answered by that bulb, which the app logs as
+            /// `onHeartBeat: <light_id>, <group_id>, <version>`). It is what turns every
+            /// membership question in this component from an inference about what we SENT into
+            /// an observation of what a bulb REPORTS - see observed_light_group_.
+            ///
+            /// 16 bytes, mesh-key XOR only: no whitening, no framing marker, no CRC, which is
+            /// why handle_sniffed_payload_() has to test for it before it un-whitens anything.
+            ///
+            ///   [0]      0x5a, the marker
+            ///   [1..4]   per-bulb, not decoded - differs per bulb, stable across frames
+            ///   [5]      light_id
+            ///   [6]      group_id, 0 when the bulb is in no group
+            ///   [7],[8],[14] and [10..13] little-endian u32, [9] - firmware version
+            ///                components, identical across all six bulbs here
+            void handle_heartbeat_(const std::vector<uint8_t> &hb);
+
             /// Remember an inner payload we are about to transmit. The bulbs RELAY every
             /// frame (confirmed live 2026-09-03: six distinct BLE addresses, one per bulb,
             /// rebroadcast each command), so the sniffer hears everything this controller
@@ -537,6 +557,11 @@ namespace esphome
             static const uint16_t MANUFACTURER_DATA_ID = 0xfff0;
             static const uint8_t GROUP_MARKER_HI = 0x2a;
             static const uint8_t GROUP_MARKER_LO = 0xa8;
+
+            /// Bulb status broadcast - see handle_heartbeat_(). The marker is the value after
+            /// the mesh-key XOR, not the raw wire byte, so it holds for any mesh key.
+            static const size_t HEARTBEAT_LEN = 16;
+            static const uint8_t HEARTBEAT_MARKER = 0x5a;
         };
 
     } // namespace fastcon

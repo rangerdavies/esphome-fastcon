@@ -18,7 +18,7 @@
 #include "utils.h"
 
 #ifndef FASTCON_VERSION
-#define FASTCON_VERSION "0.3.5-dev"
+#define FASTCON_VERSION "0.3.6-dev"
 #endif
 
 namespace esphome {
@@ -996,7 +996,43 @@ bool FastconController::parse_device(const ble_device_base::ESPBTDevice &device)
 }
 #endif
 
+void FastconController::handle_heartbeat_(const std::vector<uint8_t> &hb) {
+  const uint8_t light_id = hb[5];
+  const uint8_t group_id = hb[6];
+
+  const int had = this->observed_group_of(light_id);
+  // Ground truth, straight from the bulb. Everything else that writes this map is recording
+  // what we ASKED for; this records what actually stuck. Where they disagree the bulb wins,
+  // which is the entire point - a membership write that was never applied used to leave the
+  // map claiming success with nothing able to contradict it.
+  this->observed_light_group_[light_id] = group_id;
+
+  if (had != (int) group_id) {
+    ESP_LOGI(TAG, "HEARTBEAT light %u is in group %u (was %s)", (unsigned) light_id,
+             (unsigned) group_id, had < 0 ? "unknown" : std::to_string(had).c_str());
+  } else {
+    ESP_LOGD(TAG, "HEARTBEAT light %u is in group %u", (unsigned) light_id, (unsigned) group_id);
+  }
+}
+
 void FastconController::handle_sniffed_payload_(const std::vector<uint8_t> &payload) {
+  // Bulb status broadcast - test first, because it is none of the things the rest of this
+  // function knows how to take apart: 16 bytes, mesh-key XOR only, no whitening and no
+  // framing marker, so un-whitening it first would turn it into noise that falls out of the
+  // bottom as "no framing marker". Keyed on the decoded marker rather than the raw byte so
+  // it does not depend on this mesh's particular key. See handle_heartbeat_()'s own comment
+  // (fastcon_controller.h) for the layout and where it came from.
+  if (payload.size() == HEARTBEAT_LEN) {
+    std::vector<uint8_t> hb(HEARTBEAT_LEN);
+    for (size_t i = 0; i < HEARTBEAT_LEN; i++)
+      hb[i] = payload[i] ^ this->mesh_key_[i % 4];
+    if (hb[0] == HEARTBEAT_MARKER) {
+      ESP_LOGD(TAG, "SNIFF heartbeat %s", sniff_hex(hb).c_str());
+      this->handle_heartbeat_(hb);
+      return;
+    }
+  }
+
   // Whitening XORs against a position-keyed stream and is therefore its own inverse,
   // but that stream starts 0xf bytes before the part which goes on the air. Rebuild the
   // offset so the keystream lines up, then take the padding back off.
