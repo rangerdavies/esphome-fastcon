@@ -236,6 +236,18 @@ namespace esphome
             /// PendingRetransmit is scheduled per entry, in order; an empty vector behaves
             /// like retransmit_enabled_ == false (nothing ever gets scheduled).
             void set_retransmit_delays(std::vector<uint32_t> delays_ms) { retransmit_delays_ = std::move(delays_ms); }
+            /// Master switch for ensure_group()'s "skip the membership write if every member
+            /// is already tracked as this group" optimization (2026-09-07, per direct request
+            /// "change esphome to allow the group membership write skip to be configurable" -
+            /// added after live testing the night of 2026-09-07 repeatedly showed the skip path
+            /// (bare control frame, no membership write) landing on 0-2 of 3 members while the
+            /// forced-write path (invalidate the cache, then redispatch) landed on all 3 every
+            /// time it was tried). When false, ensure_group() always treats every member as
+            /// needing a write - the pre-2026-09-07 unconditional-rewrite behavior - regardless
+            /// of what observed_light_group_ believes. The cache is still updated either way
+            /// (see ensure_group()'s own comment), so flipping this back to true later resumes
+            /// skipping from whatever the cache currently holds.
+            void set_skip_tracked_membership(bool b) { skip_tracked_membership_ = b; }
             /// No longer affects behavior (2026-09-03) - ensure_group() rewrites membership
             /// unconditionally on every call now, see its own header comment. Kept only so the
             /// `fastcon: membership_ttl:` YAML option (fastcon_controller.py) still compiles for
@@ -483,6 +495,8 @@ namespace esphome
             /// See set_retransmit_enabled()/set_retransmit_delays()'s own comments.
             bool retransmit_enabled_{true};
             std::vector<uint32_t> retransmit_delays_{1000, 5000};
+            /// See set_skip_tracked_membership()'s own comment.
+            bool skip_tracked_membership_{true};
             uint32_t membership_ttl_{30000};  // unused - see set_membership_ttl()'s own comment
             uint8_t group_slot_{0xfd};
 

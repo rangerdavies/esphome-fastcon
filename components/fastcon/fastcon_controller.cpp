@@ -623,15 +623,28 @@ void FastconController::ensure_group(uint8_t group_id, const std::vector<uint8_t
   // changed.
   std::vector<uint8_t> write_mask = mask;
   bool needs_write = false;
-  for (size_t byte = 0; byte < mask.size(); byte++) {
-    for (int bit = 0; bit < 8; bit++) {
-      if (!(mask[byte] & (1 << bit)))
-        continue;
-      const uint8_t id = (uint8_t) (byte * 8 + bit + 1);
-      if (this->observed_group_of(id) == (int) group_id) {
-        write_mask[byte] &= ~(1 << bit);  // already tracked as this group - skip it
-      } else {
-        needs_write = true;
+  // Configurable (2026-09-07, per direct request) - when skip_tracked_membership_ is
+  // false, every member is treated as needing a write, full stop, restoring the
+  // pre-2026-09-07 unconditional-rewrite behavior. See set_skip_tracked_membership()'s
+  // own comment for why: live testing that night repeatedly showed the skip path (bare
+  // control frame, no membership write) reaching 0-2 of 3 members while a forced write
+  // reached all 3 every time - the narrowing check below is the thing to disable first
+  // when chasing that, before touching anything else.
+  if (!this->skip_tracked_membership_) {
+    // mask is guaranteed non-empty here (see the early return above) - write_mask stays
+    // the full, unnarrowed mask and every member is written, unconditionally.
+    needs_write = true;
+  } else {
+    for (size_t byte = 0; byte < mask.size(); byte++) {
+      for (int bit = 0; bit < 8; bit++) {
+        if (!(mask[byte] & (1 << bit)))
+          continue;
+        const uint8_t id = (uint8_t) (byte * 8 + bit + 1);
+        if (this->observed_group_of(id) == (int) group_id) {
+          write_mask[byte] &= ~(1 << bit);  // already tracked as this group - skip it
+        } else {
+          needs_write = true;
+        }
       }
     }
   }

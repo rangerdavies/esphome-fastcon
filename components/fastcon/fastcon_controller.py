@@ -21,6 +21,7 @@ CONF_COMMAND_RETRIES = "command_retries"
 CONF_GROUP_SETTLE = "group_settle"
 CONF_RETRANSMIT_ENABLED = "retransmit_enabled"
 CONF_RETRANSMIT_DELAYS = "retransmit_delays"
+CONF_SKIP_TRACKED_MEMBERSHIP = "skip_tracked_membership"
 
 DEFAULT_ADV_INTERVAL_MIN = 0x20
 DEFAULT_ADV_INTERVAL_MAX = 0x40
@@ -53,6 +54,16 @@ DEFAULT_GROUP_SETTLE = "250ms"
 # original fixed behavior.
 DEFAULT_RETRANSMIT_ENABLED = True
 DEFAULT_RETRANSMIT_DELAYS = ["1s", "5s"]
+
+# ensure_group()'s "skip the membership write if every member is already tracked as
+# this group" optimization - on by default, matching the firmware's current behavior.
+# Set to false to force every group dispatch to always rewrite membership for every
+# member, unconditionally (the pre-2026-09-07 behavior) - see
+# FastconController::set_skip_tracked_membership()'s own comment (fastcon_controller.h)
+# for why this exists: live testing the night of 2026-09-07 repeatedly showed the skip
+# path landing on only 0-2 of a group's 3 members while a forced rewrite landed on all
+# 3 every time it was tried.
+DEFAULT_SKIP_TRACKED_MEMBERSHIP = True
 
 
 def validate_hex_bytes(value):
@@ -120,6 +131,9 @@ CONFIG_SCHEMA = cv.Schema(
         cv.Optional(
             CONF_RETRANSMIT_DELAYS, default=DEFAULT_RETRANSMIT_DELAYS
         ): cv.ensure_list(cv.positive_time_period_milliseconds),
+        cv.Optional(
+            CONF_SKIP_TRACKED_MEMBERSHIP, default=DEFAULT_SKIP_TRACKED_MEMBERSHIP
+        ): cv.boolean,
     }
 ).extend(cv.COMPONENT_SCHEMA).extend(esp32_ble_tracker.ESP_BLE_DEVICE_SCHEMA)
 
@@ -155,6 +169,7 @@ async def to_code(config):
             [int(delay.total_milliseconds) for delay in config[CONF_RETRANSMIT_DELAYS]]
         )
     )
+    cg.add(var.set_skip_tracked_membership(config[CONF_SKIP_TRACKED_MEMBERSHIP]))
 
     if config[CONF_SNIFFER]:
         cg.add(var.set_sniffer_enabled(True))
