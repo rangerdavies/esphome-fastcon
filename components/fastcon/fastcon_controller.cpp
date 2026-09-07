@@ -75,6 +75,13 @@ void FastconController::queueCommand(uint32_t light_id_, const std::vector<uint8
   //     bare membership write never triggers this rule - it carries no light state, so
   //     there is nothing for a queued group's control frame to be made redundant by.
   size_t superseded = 0;
+  // Group_ids whose queued CONTROL frame this pass erases via rule 4 below - their sibling
+  // GROUP_MEMBERSHIP entry (if still queued) is orphaned by that same erasure and gets swept
+  // up in the second pass following this loop. See queueCommand()'s own header comment
+  // (fastcon_controller.h) for why: "the queue should process them as a set" - a membership
+  // rewrite left behind for a control frame that will never follow it is worse than useless,
+  // it needlessly reassigns bulbs to a group nothing is ever going to command.
+  std::vector<uint32_t> orphaned_group_ids;
   for (auto it = this->queue_.begin(); it != this->queue_.end();) {
     bool erase = false;
     if (!it->data.empty()) {
@@ -106,6 +113,8 @@ void FastconController::queueCommand(uint32_t light_id_, const std::vector<uint8
           if (superset)
             erase = true;
         }
+        if (erase)
+          orphaned_group_ids.push_back(it->target);
       }
     }
     if (erase) {
@@ -113,6 +122,17 @@ void FastconController::queueCommand(uint32_t light_id_, const std::vector<uint8
       superseded++;
     } else {
       ++it;
+    }
+  }
+  if (!orphaned_group_ids.empty()) {
+    for (auto it = this->queue_.begin(); it != this->queue_.end();) {
+      if (it->kind == CommandKind::GROUP_MEMBERSHIP &&
+          std::find(orphaned_group_ids.begin(), orphaned_group_ids.end(), it->target) != orphaned_group_ids.end()) {
+        it = this->queue_.erase(it);
+        superseded++;
+      } else {
+        ++it;
+      }
     }
   }
   if (superseded > 0) {
@@ -619,6 +639,19 @@ void FastconController::ensure_group(uint8_t group_id, const std::vector<uint8_t
   this->group_masks_[group_id] = GroupState{mask, millis()};
 }
 
+std::vector<uint8_t> FastconController::queueGroupCommand(uint8_t group_id, const std::vector<uint8_t> &mask,
+                                                             const std::vector<uint8_t> &light_data) {
+  // Membership half of the set - no-ops on its own (empty mask: group_id 0, or a group_id
+  // with no known members yet) exactly as it always has.
+  this->ensure_group(group_id, mask);
+  // Control half - queued as CommandKind::GROUP_CONTROL, linked to the membership half above
+  // by sharing the same group_id target. See queueCommand()'s own comment for how the two
+  // are kept superseded together once queued.
+  auto payload = this->group_control(group_id, light_data);
+  this->queueCommand(group_id, payload, /*repeat=*/0, CommandKind::GROUP_CONTROL, mask);
+  return payload;
+}
+
 // Dynamic groups (2026-09-02 night): brightness arrives already on the 0-127 wire scale and
 // blue/red/green/warm/cold already on the 0-255 wire scale, computed by the CALLER (an
 // `api: actions:` lambda fed by an HA-side Jinja template, see brmesh-bridge.yaml and
@@ -672,10 +705,10 @@ void FastconController::dynamic_group_command(uint8_t group_id, const std::vecto
     };
   }
 
-  // Same time-sync bracketing + ensure_group/group_control/queueCommand order as
-  // FastconLight::write_state()'s own group path - see that method's own comments
-  // (fastcon_light.cpp) for why. ensure_group() itself already no-ops on an empty mask
-  // (group 0's own case, per the guard above, and any group_id passed with no members).
+  // Same time-sync bracketing + queueGroupCommand() order as FastconLight::write_state()'s
+  // own group path - see that method's own comments (fastcon_light.cpp) for why.
+  // queueGroupCommand() itself already no-ops its membership half on an empty mask (group
+  // 0's own case, per the guard above, and any group_id passed with no members).
   //
   // Captured by value, not by reference: this same lambda is also handed to
   // schedule_retransmits() below and can run again 1-5 seconds from now, well after this
@@ -688,9 +721,7 @@ void FastconController::dynamic_group_command(uint8_t group_id, const std::vecto
     // means its own frames sit far longer than this log line's own timestamp implies.
     const size_t queue_size_before = this->get_queue_size();
     this->send_time_sync();
-    this->ensure_group(group_id, mask);
-    auto payload = this->group_control(group_id, light_data);
-    this->queueCommand(group_id, payload, /*repeat=*/0, CommandKind::GROUP_CONTROL, mask);
+    auto payload = this->queueGroupCommand(group_id, mask, light_data);
     this->send_time_sync();
 
     // The group frame is on its way; now make the individual entities agree with it, so a

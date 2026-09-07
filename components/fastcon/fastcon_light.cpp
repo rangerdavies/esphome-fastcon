@@ -230,27 +230,16 @@ void FastconLight::write_state(light::LightState *state) {
       // if no time_id is configured on the controller.
       controller->send_time_sync();
 
-      // Claim the slot before addressing it - unconditionally, every call (2026-09-03: these
-      // bulbs hold exactly one group assignment each, so a bulb shared with any OTHER group_id
-      // this controller has since addressed may already have been silently evicted from this
-      // one; see FastconController::ensure_group()'s own comment for the confirmed-live
-      // incident this fixed).
-      controller->ensure_group((uint8_t) addr, members);
-      payload = controller->group_control((uint8_t) addr, light_bytes);
+      // Membership + control frame, queued together as one linked set - see
+      // FastconController::queueGroupCommand()'s own comment for the confirmed-live
+      // incident that made this the one entry point for a group dispatch, and for how the
+      // queue keeps the pair superseded together.
+      payload = controller->queueGroupCommand((uint8_t) addr, members, light_bytes);
+      controller->send_time_sync();
     } else {
       payload = controller->single_control(light_id, light_bytes);
+      controller->queueCommand(addr, payload, /*repeat=*/0, CommandKind::INDIVIDUAL);
     }
-
-    // Queue it for advertisement. `members` is this entity's own membership bitmask -
-    // empty for an individual entity, which is exactly when is_group is also false, so
-    // this is equivalent to the old unconditional call in that case. Note this is the
-    // group's CONTROL frame only - its membership write already went out separately, via
-    // ensure_group() above (which queues its own CommandKind::GROUP_MEMBERSHIP command).
-    controller->queueCommand(addr, payload, /*repeat=*/0,
-                              is_group ? CommandKind::GROUP_CONTROL : CommandKind::INDIVIDUAL, members);
-
-    if (is_group)
-      controller->send_time_sync();
 
     ESP_LOGD(TAG, "Queued state v%s: %s=%u, payload_len=%d queue_before=%zu queue_after=%zu",
              FASTCON_VERSION, is_group ? "group" : "light_id", addr, (int) payload.size(),

@@ -65,6 +65,27 @@ namespace esphome
             /// purpose - group_masks_ is kept only as a last-written record.
             void ensure_group(uint8_t group_id, const std::vector<uint8_t> &mask);
 
+            /// Queue a full group command - a group's membership definition together with its
+            /// control frame - as ONE linked set (2026-09-07, per direct request: "let's
+            /// consider group commands to be a command set of membership and state... the
+            /// queue should process them as a set, the api should receive it as a set"). This
+            /// is now the ONE entry point for dispatching a group: callers no longer sequence
+            /// ensure_group()+group_control()+queueCommand() by hand, so the pair is always
+            /// created - and superseded - together. Returns the control frame's own payload
+            /// (callers that only wanted it for logging no longer need to call group_control()
+            /// themselves). `mask` is this group's membership bitmask (empty for group_id 0 or
+            /// an as-yet-unmanaged group - ensure_group()'s own no-op case); `light_data` is
+            /// the already-computed wire bytes (get_light_data()/get_white_light_data(), or a
+            /// dynamic caller's own bytes - see dynamic_group_command()'s comment). See
+            /// queueCommand()'s own comment (fastcon_controller.cpp) for exactly how the queue
+            /// keeps the two halves linked once queued: a fresh membership write for the same
+            /// group_id still clears both (unchanged), and - new here - superseding this set's
+            /// own control frame via the cross-group-superset rule now also clears its sibling
+            /// membership write, rather than stranding a membership rewrite in the queue for a
+            /// control frame that will never follow it.
+            std::vector<uint8_t> queueGroupCommand(uint8_t group_id, const std::vector<uint8_t> &mask,
+                                                     const std::vector<uint8_t> &light_data);
+
             /// Queue a cmd-9 time-sync frame, matching the app's own habit of sending one right
             /// before and right after a group action - a live A/B test for whether that primes
             /// the mesh into a more receptive state. No-op (logs at debug) if no time source is
@@ -87,9 +108,10 @@ namespace esphome
             /// `brightness` is 0-127 (the wire scale, already divided down from HA's 0-255 - see
             /// this method's own .cpp comment for why no scaling happens here). `blue`/`red`/
             /// `green`/`warm`/`cold` are each 0-255, matching get_light_data()'s own wire format.
-            /// Same ensure_group()+group_control()+queueCommand()+send_time_sync() sequence as
-            /// FastconLight::write_state()'s own group path (fastcon_light.cpp) - deliberately not
-            /// factored into a shared helper, to keep that entity-bound path untouched by this one.
+            /// Same queueGroupCommand()+send_time_sync() sequence as FastconLight::write_state()'s
+            /// own group path (fastcon_light.cpp) - deliberately not factored into a shared
+            /// helper beyond queueGroupCommand() itself, to keep that entity-bound path
+            /// untouched by this one.
             void dynamic_group_command(uint8_t group_id, const std::vector<uint8_t> &members,
                                         bool state, uint8_t brightness,
                                         uint8_t blue, uint8_t red, uint8_t green,
@@ -117,7 +139,13 @@ namespace esphome
             ///      of its own members, and a queued different group_id's GROUP_CONTROL only
             ///      when this group's membership fully covers it - never the reverse, never a
             ///      partial/unrelated overlap, and never triggered by a bare membership write
-            ///      (which carries no light state to justify a cross-target supersede).
+            ///      (which carries no light state to justify a cross-target supersede). When
+            ///      this clears a queued different group_id's GROUP_CONTROL, its sibling
+            ///      GROUP_MEMBERSHIP entry (same group_id, if still queued) is cleared right
+            ///      alongside it (2026-09-07, "the queue should process them as a set") -
+            ///      otherwise a stale membership rewrite for that now-cancelled dispatch would
+            ///      still go out, reassigning bulbs to a group whose control frame is never
+            ///      coming.
             /// Leave `group_mask` empty for `group_id == 0` (the firmware "all lights" group,
             /// which never gets an explicit membership list) - `light_id_ == 0` alone is
             /// enough to mean "every light is a member." Leave both at their defaults for an
