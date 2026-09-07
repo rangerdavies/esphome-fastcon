@@ -599,42 +599,76 @@ void FastconController::ensure_group(uint8_t group_id, const std::vector<uint8_t
   if (mask.empty())
     return;  // group is managed elsewhere (id 0, or defined in the app)
 
-  // Always rewrite membership (2026-09-03, per direct confirmation of real hardware
-  // behavior: "the lights only hold 1 group assignment, anytime a group is commanded the
-  // membership must be rewritten"). This used to skip the write whenever group_masks_
-  // already held the same mask for this group_id within membership_ttl_, on the assumption
-  // a bulb remembers membership in several different groups at once and only needs
-  // reminding once that record goes stale. False on this hardware: each bulb has exactly
-  // one group slot, so ANY other group_id's membership write that happens to include this
-  // same bulb silently evicts it from this group - with no ack in this protocol, this
-  // controller has no way to detect that eviction, and the old group_masks_ freshness check
-  // had no way to know a different group_id had since claimed the same bulb. Confirmed live
-  // 2026-09-03: Day Light's group 23 (lights 2/4/6, shared with TV Low's groups 20/21 and
-  // Evening's shared group_slot) failed to turn off on a repeat dispatch that skipped
-  // re-defining membership (still "fresh" under the old membership_ttl_ window) - almost
-  // certainly because an intervening command to one of those other group_ids had already
-  // reclaimed one or more of the same bulbs. membership_ttl_ and the group_masks_ freshness
-  // check are consequently unused now (the config option/setter are kept for backward YAML
-  // compatibility - see fastcon_controller.py) - every call now pays the full
-  // membership-write-plus-retries cost, matching what real captured app traffic already
-  // suggested (it never assumes a bulb remembers a prior group either).
-  ESP_LOGD(TAG, "Defining group %u (%zu mask byte(s))", (unsigned) group_id, mask.size());
+  // Narrow the write to only members NOT already tracked as being in THIS group
+  // (2026-09-07, per direct request: "the only purpose to tracking the groupId was to
+  // avoid membership writes for a light that was already in a group... if a group set
+  // command is received for a different group then the incoming group's id needs to be
+  // applied to the light's groupId"). This replaces the unconditional-rewrite rule added
+  // 2026-09-03 after a confirmed live incident: a TTL-based freshness cache (membership_ttl_/
+  // group_masks_) skipped a rewrite based on elapsed time alone, with no way to know a
+  // DIFFERENT group_id's dispatch had, in the meantime, silently reclaimed a shared bulb
+  // (each bulb holds exactly one group assignment). This is NOT that cache reborn - it
+  // tracks "which group is this light currently in" (observed_light_group_,
+  // fastcon_controller.h), and EVERY group dispatch (any group_id, any script) updates that
+  // same map for every member it touches, below. So the moment group 21 claims light 4,
+  // group 23's own next dispatch immediately sees light 4 is no longer tracked as 23's (its
+  // own bit stays set in write_mask) - the exact cross-group-eviction case the 2026-09-03
+  // fix was for, still caught, just without paying for a rewrite when nothing has actually
+  // changed.
+  std::vector<uint8_t> write_mask = mask;
+  bool needs_write = false;
+  for (size_t byte = 0; byte < mask.size(); byte++) {
+    for (int bit = 0; bit < 8; bit++) {
+      if (!(mask[byte] & (1 << bit)))
+        continue;
+      const uint8_t id = (uint8_t) (byte * 8 + bit + 1);
+      if (this->observed_group_of(id) == (int) group_id) {
+        write_mask[byte] &= ~(1 << bit);  // already tracked as this group - skip it
+      } else {
+        needs_write = true;
+      }
+    }
+  }
 
-  // Lights self-select from this broadcast, and a miss silently drops a light from the
-  // group, so repeat it the way the app does.
-  auto adv_data = this->set_group_members(group_id, mask);
+  if (needs_write) {
+    ESP_LOGD(TAG, "Defining group %u (%zu mask byte(s), narrowed from %zu members)",
+             (unsigned) group_id, write_mask.size(), mask.size());
 
-  // Bracket the membership write with settling pauses. Before, so a control frame already
-  // in flight to these bulbs is acted on before their group assignment moves under it;
-  // after, so the membership has landed before the control frame that follows addresses
-  // the group. Without the gaps a two-group split queues membership 22, control 22,
-  // membership 23, control 23 back to back at ~60ms a frame, and a bulb that is still
-  // chewing on one frame gets its group reassigned before the next arrives.
-  this->queue_settle(this->group_settle_ms_);
-  // Pass the membership retry count explicitly: queueCommand defaults to
-  // command_retries_, and letting both apply would send this nine times.
-  this->queueCommand(group_id, adv_data, this->membership_retries_, CommandKind::GROUP_MEMBERSHIP, mask);
-  this->queue_settle(this->group_settle_ms_);
+    // Lights self-select from this broadcast, and a miss silently drops a light from the
+    // group, so repeat it the way the app does.
+    auto adv_data = this->set_group_members(group_id, write_mask);
+
+    // Bracket the membership write with settling pauses. Before, so a control frame already
+    // in flight to these bulbs is acted on before their group assignment moves under it;
+    // after, so the membership has landed before the control frame that follows addresses
+    // the group. Without the gaps a two-group split queues membership 22, control 22,
+    // membership 23, control 23 back to back at ~60ms a frame, and a bulb that is still
+    // chewing on one frame gets its group reassigned before the next arrives. Skipped
+    // entirely below when no write is needed - there is nothing to protect the timing of.
+    this->queue_settle(this->group_settle_ms_);
+    // Pass the membership retry count explicitly: queueCommand defaults to
+    // command_retries_, and letting both apply would send this nine times. `mask` here
+    // (the group's full intended membership), not `write_mask` (the narrowed wire
+    // payload) - the queue's own cross-group-supersede rule (queueCommand()'s own comment)
+    // reasons about this group's whole membership, not which subset happened to need an
+    // actual wire write this time.
+    this->queueCommand(group_id, adv_data, this->membership_retries_, CommandKind::GROUP_MEMBERSHIP, mask);
+    this->queue_settle(this->group_settle_ms_);
+  } else {
+    ESP_LOGD(TAG, "Group %u: every member already tracked as this group - skipping membership write",
+             (unsigned) group_id);
+  }
+
+  // Record the FULL intended membership as this dispatch's own belief, regardless of
+  // whether a write was actually sent for every member - this is what lets a LATER,
+  // different group_id's dispatch detect these members need reclaiming (see this method's
+  // own comment above).
+  for (size_t byte = 0; byte < mask.size(); byte++) {
+    for (int bit = 0; bit < 8; bit++) {
+      if (mask[byte] & (1 << bit))
+        this->observed_light_group_[(uint8_t) (byte * 8 + bit + 1)] = group_id;
+    }
+  }
 
   this->group_masks_[group_id] = GroupState{mask, millis()};
 }

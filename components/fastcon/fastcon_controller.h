@@ -310,8 +310,21 @@ namespace esphome
             bool sniffer_enabled_{false};
             std::vector<FastconLight *> lights_;
 
-            /// light_id -> group_id, learned from sniffed cmd-1 assignment frames. Lets a
-            /// sniffed group command update the individual entities that group contains.
+            /// light_id -> group_id: which group this controller currently believes each
+            /// light is in - "believes", not just "observed", as of 2026-09-07 (per direct
+            /// request, "a light maintains knowledge of which group it is currently in").
+            /// Updated from two sources: sniffed cmd-1 assignment frames (original purpose -
+            /// lets a sniffed group command update the individual entities that group
+            /// contains), AND now also directly by ensure_group() the moment THIS controller
+            /// dispatches a group, so our own intent is reflected immediately rather than
+            /// waiting on an eventual sniffed self-relay to confirm it. ensure_group() also
+            /// READS this map to skip re-writing membership for a light already tracked as
+            /// being in the group it's about to (re)define - see that method's own comment
+            /// for why this is safe despite the confirmed-live incident that made membership
+            /// writes unconditional in the first place: unlike that incident's stale TTL
+            /// cache, this map is kept current by EVERY group dispatch that touches a light,
+            /// so a different group_id claiming a shared bulb is immediately visible here the
+            /// next time anything checks it.
             std::map<uint8_t, uint8_t> observed_light_group_;
 
             struct Command
