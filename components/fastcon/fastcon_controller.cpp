@@ -18,7 +18,7 @@
 #include "utils.h"
 
 #ifndef FASTCON_VERSION
-#define FASTCON_VERSION "0.3.4-dev"
+#define FASTCON_VERSION "0.3.5-dev"
 #endif
 
 namespace esphome {
@@ -74,7 +74,15 @@ void FastconController::queueCommand(uint32_t light_id_, const std::vector<uint8
   //     members aren't also in the new group, which nothing here would ever re-address. A
   //     bare membership write never triggers this rule - it carries no light state, so
   //     there is nothing for a queued group's control frame to be made redundant by.
+  //  5. A TIME_SYNC frame takes no part in any of this, in either direction. It carries no
+  //     light state, so it can never make another frame stale, and it is a component OF the
+  //     group dispatch that queued it rather than an independent entry, so nothing that
+  //     dispatch queues afterwards may remove it. Without this the two brackets around a
+  //     single group dispatch deleted each other under rule 2 - see CommandKind::TIME_SYNC's
+  //     own comment (fastcon_controller.h) for the capture that caught it.
   size_t superseded = 0;
+  // Short-circuits the whole scan for a TIME_SYNC without re-indenting it (rule 5).
+  const bool scan = (kind != CommandKind::TIME_SYNC);
   // Group_ids whose queued CONTROL frame this pass erases via rule 4 below - their sibling
   // GROUP_MEMBERSHIP entry (if still queued) is orphaned by that same erasure and gets swept
   // up in the second pass following this loop. See queueCommand()'s own header comment
@@ -82,9 +90,10 @@ void FastconController::queueCommand(uint32_t light_id_, const std::vector<uint8
   // rewrite left behind for a control frame that will never follow it is worse than useless,
   // it needlessly reassigns bulbs to a group nothing is ever going to command.
   std::vector<uint32_t> orphaned_group_ids;
-  for (auto it = this->queue_.begin(); it != this->queue_.end();) {
+  for (auto it = this->queue_.begin(); scan && it != this->queue_.end();) {
     bool erase = false;
-    if (!it->data.empty()) {
+    // Rule 5, the receiving half: a queued TIME_SYNC is never a supersede candidate.
+    if (!it->data.empty() && it->kind != CommandKind::TIME_SYNC) {
       if (kind == CommandKind::GROUP_MEMBERSHIP && it->target == light_id_) {
         erase = true;  // rule 1
       } else if (it->target == light_id_ && it->kind == kind) {
@@ -877,8 +886,14 @@ void FastconController::send_time_sync() {
 
   // Once, not command_retries_ times: this carries no state worth re-asserting, and it is
   // already queued twice around every group action.
+  //
+  // CommandKind::TIME_SYNC, not the INDIVIDUAL default: this frame is a component of
+  // whichever group dispatch queued it, not a queue entry standing on its own, so it must
+  // neither supersede nor be superseded. As INDIVIDUAL it was both - see that enumerator's
+  // own comment (fastcon_controller.h) for the two ways that erased it before it transmitted.
   this->note_sent_(data);
-  this->queueCommand(TIME_SYNC_TARGET, this->generate_command(5, 0, data, true), 1);
+  this->queueCommand(TIME_SYNC_TARGET, this->generate_command(5, 0, data, true), 1,
+                     CommandKind::TIME_SYNC);
 #else
   // No `time:` platform anywhere in this build, so time_id could never have been set
   // (its schema requires cv.use_id(time.RealTimeClock)) - time_source_ is always null.

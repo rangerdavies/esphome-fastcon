@@ -36,6 +36,21 @@ namespace esphome
             INDIVIDUAL,        ///< target is a single light_id.
             GROUP_MEMBERSHIP,  ///< target is a group_id; defines who is in it.
             GROUP_CONTROL,     ///< target is a group_id; commands its current members.
+            /// A cmd-9 clock frame bracketing a group dispatch. It belongs TO that dispatch
+            /// rather than standing on its own, so it neither supersedes nor is superseded -
+            /// see queueCommand()'s own scan (fastcon_controller.cpp).
+            ///
+            /// Added 2026-09-07 after a paired phone/ESP32 capture showed the LEADING
+            /// time-sync of every group dispatch being erased before it ever transmitted:
+            /// both brackets queued as INDIVIDUAL on the shared TIME_SYNC_TARGET, so rule 2
+            /// ("same target and same kind supersedes") had the trailing one delete the
+            /// leading one, every time, logged as "Superseded 1 stale queued frame(s) for
+            /// target 256". Net effect was one clock frame per dispatch landing AFTER the
+            /// control frames, and dead air in the membership->control gap where the phone
+            /// app puts its own. A group-0 dispatch was worse still: rule 3 erases any
+            /// queued INDIVIDUAL outright when light_id_ == 0, which swept up time-syncs
+            /// too. Giving them their own kind closes both.
+            TIME_SYNC,
         };
 
         class FastconController : public Component
