@@ -92,9 +92,21 @@ void FastconLight::apply_observed(bool is_group, uint8_t addr, const std::vector
   auto call = this->light_state_->make_call();
   this->fill_call_(call, ld);
 
-  // Remember what this will make write_state() compute, so the resulting call does not
-  // put a frame back on the air for a command we merely overheard.
-  this->suppress_echo_ = ld;
+  // Unconditional suppression (2026-09-07, was value-matched against the raw observed
+  // bytes) - matches publish_group_state()'s own reasoning: the round trip through
+  // ESPHome's colour model (wire bytes -> mireds -> internal LightColorValues -> wire
+  // bytes again for the match check) is not lossless, so a byte-exact comparison let a
+  // rounding-step difference through and re-transmitted it for real. Confirmed live as
+  // the source of a slow color_temp_kelvin drift: this path fires on every sniffed
+  // self-relay of our own commands (routine during TV Low's high dispatch frequency -
+  // see scripts.yaml's own header on why only TV Low hits these timing-dependent bugs),
+  // and each drifted re-transmission became the next cycle's own starting point for
+  // another rounding step. The one thing the old value-matched approach protected
+  // against - a genuinely different command landing in this exact synchronous
+  // call.perform()/write_state() call chain - is a same-tick window, not real elapsed
+  // time, so the risk of swallowing a real concurrent change here is negligible next to
+  // the confirmed, recurring cost of the drift.
+  this->suppress_next_write_ = true;
   call.perform();
 }
 
@@ -184,24 +196,17 @@ void FastconLight::write_state(light::LightState *state) {
     light_bytes = this->controller_->get_light_data(state);
   }
 
-  // State we published ourselves after a group command already went out. Transmitting
-  // again would just duplicate it, once per member.
+  // State we already know is correctly on the mesh - either published by us after a
+  // group command went out (transmitting again would just duplicate it, once per
+  // member), or applied from a frame the sniffer overheard (own delayed self-relay or a
+  // genuinely foreign controller; publishing it was the whole point, putting it back on
+  // the air is not). Unconditional in both cases - see apply_observed()'s own comment
+  // for why a value-matched check here is the wrong tool.
   if (this->suppress_next_write_) {
     this->suppress_next_write_ = false;
-    ESP_LOGD(TAG, "Not retransmitting group state for %s %u", is_group ? "group" : "light", addr);
+    ESP_LOGD(TAG, "Not retransmitting %s %u - already applied, not a new command",
+             is_group ? "group" : "light", addr);
     return;
-  }
-
-  // If this write is only the echo of a command we overheard from another controller,
-  // publishing it was the whole point - putting it back on the air is not.
-  if (!this->suppress_echo_.empty()) {
-    const bool echo = (light_bytes == this->suppress_echo_);
-    this->suppress_echo_.clear();
-    if (echo) {
-      ESP_LOGD(TAG, "Not rebroadcasting an overheard command for %s %u",
-               is_group ? "group" : "light", addr);
-      return;
-    }
   }
 
   // Wrap into the inner payload for this address. Captured by value in `send` below, not by

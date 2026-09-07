@@ -83,17 +83,15 @@ class FastconLight : public Component, public light::LightOutput {
 
   light::LightState *light_state_{nullptr};
 
-  /// Set when the sniffer publishes an overheard command, so the write_state() that
-  /// publishing triggers does not rebroadcast a frame we only listened to. Matched by
-  /// value rather than a bare flag, so a genuine command that happens to land in the
-  /// same window is still sent.
-  std::vector<uint8_t> suppress_echo_;
-
-  /// Unconditional one-shot suppression, for state we published ourselves after a group
-  /// command. Unlike suppress_echo_ this does not compare values: the round trip through
-  /// ESPHome colour model is not lossless, so a value check would let a rounding-step
-  /// difference through and put six individual frames on air right after the group frame
-  /// that was meant to replace them.
+  /// Unconditional one-shot suppression for a write_state() we know is not a new
+  /// command: either state we published ourselves after a group command, or state
+  /// applied from a sniffed frame (apply_observed()) - own delayed self-relay or a
+  /// genuinely foreign controller. Deliberately not value-matched (2026-09-07, was
+  /// briefly split into a value-matched suppress_echo_ for the apply_observed() case
+  /// specifically): the round trip through ESPHome's colour model is not lossless, so a
+  /// value check lets a rounding-step difference through and re-transmits it for real -
+  /// confirmed live as a slow color_temp_kelvin drift, one rounding step per sniffed
+  /// self-relay, compounding fastest during TV Low's high dispatch frequency.
   bool suppress_next_write_{false};
 };
 
