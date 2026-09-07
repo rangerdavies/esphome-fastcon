@@ -51,6 +51,13 @@ namespace esphome
             /// queued INDIVIDUAL outright when light_id_ == 0, which swept up time-syncs
             /// too. Giving them their own kind closes both.
             TIME_SYNC,
+            /// A cmd-1 `21 <light_id> <group_id>` assignment. target is the LIGHT, not the
+            /// group - one frame per bulb, so rule 2 ("same target, same kind") already gives
+            /// the right supersede behaviour: a newer assignment for a bulb replaces a queued
+            /// older one, and nothing else touches it. Deliberately NOT INDIVIDUAL, which
+            /// would let rule 3 erase these the moment the group-control frame they exist to
+            /// enable is queued behind them.
+            LIGHT_GROUP_ASSIGN,
         };
 
         class FastconController : public Component
@@ -70,6 +77,20 @@ namespace esphome
             std::vector<uint8_t> single_control(uint32_t addr, const std::vector<uint8_t> &light_data);
             std::vector<uint8_t> group_control(uint8_t group_id, const std::vector<uint8_t> &light_data);
             std::vector<uint8_t> set_group_members(uint8_t group_id, const std::vector<uint8_t> &mask);
+
+            /// cmd 1 - `21 <light_id> <group_id>`, group_id 0 meaning "no group". This is how
+            /// the phone app provisions a persistent group, confirmed by capture 2026-09-07:
+            /// one frame per light, three advertisements each, no cmd 5 involved anywhere.
+            ///
+            /// A bulb stores exactly ONE group id, so this is a scalar write, not a set
+            /// operation - adding a bulb to a group silently removes it from whatever it was
+            /// in, and removing one needs an explicit assignment to 0.
+            ///
+            /// THE FORWARD BIT IS CLEAR on this command and only this command (body[0] = 0x50
+            /// rather than 0xd0). Verified against the captured wire form, which decodes to
+            /// exactly that. Send it with forward=true and it will do nothing at all, with no
+            /// error anywhere.
+            std::vector<uint8_t> assign_light_group(uint8_t light_id, uint8_t group_id);
 
             /// Write the membership of `group_id`, unconditionally, every time this is called.
             /// (2026-09-03 - no longer skips on a "still fresh" cache hit: these bulbs hold
@@ -358,6 +379,13 @@ namespace esphome
             ///                components, identical across all six bulbs here
             void handle_heartbeat_(const std::vector<uint8_t> &hb);
 
+            /// Provision `group_id` with cmd 1, one frame per bulb - the mechanism the app
+            /// itself uses. Queues an eviction (`21 <id> 00`) for every bulb we believe is in
+            /// this group but which `mask` does not include, then an assignment for every
+            /// member. Evictions go first so a departing bulb stops answering before the
+            /// control frame this is provisioning for goes out.
+            void assign_group_members_cmd1_(uint8_t group_id, const std::vector<uint8_t> &mask);
+
             /// Remember an inner payload we are about to transmit. The bulbs RELAY every
             /// frame (confirmed live 2026-09-03: six distinct BLE addresses, one per bulb,
             /// rebroadcast each command), so the sniffer hears everything this controller
@@ -562,6 +590,14 @@ namespace esphome
             /// the mesh-key XOR, not the raw wire byte, so it holds for any mesh key.
             static const size_t HEARTBEAT_LEN = 16;
             static const uint8_t HEARTBEAT_MARKER = 0x5a;
+
+            /// The phone app's ad-hoc scratch slot. Every multi-select it makes rewrites this
+            /// one id with a cmd-5 mask, and five captures have never seen it use cmd 5 on
+            /// anything else. So this is the ONLY id ensure_group() provisions that way; every
+            /// other group goes through cmd 1, which is what the app itself uses for the
+            /// groups it keeps. Driving a dedicated id with cmd 5 was the 2026-09-07 bug: the
+            /// frames were byte-perfect and the bulbs simply never enrolled.
+            static const uint8_t SCRATCH_GROUP_ID = 0xfd;
         };
 
     } // namespace fastcon

@@ -18,7 +18,7 @@
 #include "utils.h"
 
 #ifndef FASTCON_VERSION
-#define FASTCON_VERSION "0.3.6-dev"
+#define FASTCON_VERSION "0.3.7-dev"
 #endif
 
 namespace esphome {
@@ -94,8 +94,12 @@ void FastconController::queueCommand(uint32_t light_id_, const std::vector<uint8
     bool erase = false;
     // Rule 5, the receiving half: a queued TIME_SYNC is never a supersede candidate.
     if (!it->data.empty() && it->kind != CommandKind::TIME_SYNC) {
-      if (kind == CommandKind::GROUP_MEMBERSHIP && it->target == light_id_) {
-        erase = true;  // rule 1
+      if (kind == CommandKind::GROUP_MEMBERSHIP && it->target == light_id_ &&
+          it->kind != CommandKind::LIGHT_GROUP_ASSIGN) {
+        // rule 1. The LIGHT_GROUP_ASSIGN exclusion matters because that kind targets a
+        // LIGHT while this rule compares against a GROUP id, so without it a cmd-5 write to
+        // group 253 would erase a queued assignment for light 253 purely on the numbers.
+        erase = true;
       } else if (it->target == light_id_ && it->kind == kind) {
         erase = true;  // rule 2
       } else if (kind == CommandKind::GROUP_CONTROL && it->kind == CommandKind::INDIVIDUAL) {
@@ -590,6 +594,87 @@ std::vector<uint8_t> FastconController::group_control(uint8_t group_id, const st
   return this->generate_command(5, 0, result_data, true);
 }
 
+std::vector<uint8_t> FastconController::assign_light_group(uint8_t light_id, uint8_t group_id) {
+  std::vector<uint8_t> result_data(12, 0);
+  result_data[0] = 1 | (2 << 4);  // 0x21 - cmd 1, two payload bytes follow
+  result_data[1] = light_id;
+  result_data[2] = group_id;
+
+  const auto hex_vec = vector_to_hex_string(result_data);
+  const std::string hex(hex_vec.begin(), hex_vec.end());
+  ESP_LOGD(TAG, "Assign Payload v%s (%zu bytes): %s  [light %u -> group %u]",
+           FASTCON_VERSION, result_data.size(), hex.c_str(), (unsigned) light_id,
+           (unsigned) group_id);
+
+  this->note_sent_(result_data);
+  // forward=false. Decoded straight out of the app's own captured frame: body[0] came to
+  // 0x50, where every other command's is 0xd0. See assign_light_group()'s declaration
+  // (fastcon_controller.h). The light_id argument only contributes its high byte here
+  // (generate_command divides it by 256), so it is 0 for every id this mesh can hold.
+  return this->generate_command(5, 0, result_data, /*forward=*/false);
+}
+
+void FastconController::assign_group_members_cmd1_(uint8_t group_id, const std::vector<uint8_t> &mask) {
+  // Unpack the mask into ids once. Same rule the mask is packed with everywhere else:
+  // bit N of byte K addresses light_id 8K+N+1.
+  std::vector<uint8_t> members;
+  for (size_t byte = 0; byte < mask.size(); byte++)
+    for (int bit = 0; bit < 8; bit++)
+      if (mask[byte] & (1 << bit))
+        members.push_back((uint8_t) (byte * 8 + bit + 1));
+
+  std::vector<uint8_t> to_assign;
+  for (uint8_t id : members) {
+    // Only skip when the bulb ITSELF has told us where it is. Before heartbeats this map
+    // held what we had asked for, which made the skip a guess; now a skip means a bulb
+    // broadcast this group id.
+    if (this->skip_tracked_membership_ && this->observed_group_of(id) == (int) group_id)
+      continue;
+    to_assign.push_back(id);
+  }
+
+  // Eviction. A bulb holds ONE group id, so a bulb we believe is in this group but which is
+  // not a member this time will otherwise keep answering the group's control frames - the
+  // confirmed 2026-09-07 failure exactly, where mesh 5 responded to a group 22 command whose
+  // mask did not include it. Collected before the map is touched, since the loop reads it.
+  std::vector<uint8_t> to_evict;
+  for (const auto &entry : this->observed_light_group_) {
+    if (entry.second != group_id)
+      continue;
+    if (std::find(members.begin(), members.end(), entry.first) != members.end())
+      continue;
+    to_evict.push_back(entry.first);
+  }
+
+  if (to_assign.empty() && to_evict.empty()) {
+    ESP_LOGD(TAG, "Group %u: every member already reports this group, nothing to assign",
+             (unsigned) group_id);
+    return;
+  }
+
+  ESP_LOGD(TAG, "Defining group %u via cmd 1: %u to assign, %u to evict",
+           (unsigned) group_id, (unsigned) to_assign.size(), (unsigned) to_evict.size());
+
+  // Evictions first: a bulb leaving has to stop answering before the control frame goes out,
+  // and a bulb joining is harmless either way round.
+  for (uint8_t id : to_evict) {
+    this->queueCommand(id, this->assign_light_group(id, 0), this->membership_retries_,
+                       CommandKind::LIGHT_GROUP_ASSIGN);
+    this->observed_light_group_.erase(id);
+    if (this->membership_repeat_gap_ms_ > 0)
+      this->queue_settle(this->membership_repeat_gap_ms_);
+  }
+  for (uint8_t id : to_assign) {
+    this->queueCommand(id, this->assign_light_group(id, group_id), this->membership_retries_,
+                       CommandKind::LIGHT_GROUP_ASSIGN);
+    // Optimistic, and knowingly so - a heartbeat will correct it if the bulb never applied
+    // this. That correction is the whole reason handle_heartbeat_() writes the same map.
+    this->observed_light_group_[id] = group_id;
+    if (this->membership_repeat_gap_ms_ > 0)
+      this->queue_settle(this->membership_repeat_gap_ms_);
+  }
+}
+
 std::vector<uint8_t> FastconController::set_group_members(uint8_t group_id, const std::vector<uint8_t> &mask) {
   // 18 bytes, matching the app's own logged inner payload exactly - confirmed against real
   // BRMesh captures (two live "getPayloadWithInnerRetry"/"send--->"/"calculatedPayload"
@@ -670,6 +755,27 @@ void FastconController::ensure_group(uint8_t group_id, const std::vector<uint8_t
         }
       }
     }
+  }
+
+  // cmd 1 for every real group; cmd 5 only for the app's scratch slot. Split 2026-09-07
+  // after a controlled head-to-head: the same mask 0x25, the same three bulbs, minutes
+  // apart - a cmd-5 write to dedicated id 22 enrolled 1 of 3 and left a non-member still
+  // answering, while the phone's identical cmd-5 write to 0xfd worked, and an app group
+  // (provisioned by cmd 1, then commanded with cmd 3 and nothing else) also worked. Bulbs
+  // do not enroll from cmd 5 aimed anywhere but the scratch slot. Timing was ruled out
+  // first: adv_duration 50->100, group_settle 250ms->1500ms and membership_repeat_gap all
+  // changed the airtime and none of them changed the outcome.
+  //
+  // The settle brackets stay on the cmd-5 path only. cmd 1 is per-bulb and paces itself
+  // with membership_repeat_gap between frames, and group_settle at 1500ms would otherwise
+  // add 3 seconds to every dispatch for a mechanism it was never measured against.
+  if (group_id != SCRATCH_GROUP_ID) {
+    this->assign_group_members_cmd1_(group_id, mask);
+    // observed_light_group_ is maintained inside that call, per bulb, including evictions -
+    // the blanket "record the whole intended membership" below would undo the eviction
+    // bookkeeping it just did.
+    this->group_masks_[group_id] = GroupState{mask, millis()};
+    return;
   }
 
   if (needs_write) {
