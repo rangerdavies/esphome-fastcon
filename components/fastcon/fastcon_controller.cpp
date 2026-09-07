@@ -189,9 +189,11 @@ void FastconController::schedule_retransmits(uint16_t target_key, std::function<
                       [target_key](const PendingRetransmit &p) { return p.target_key == target_key; }),
       this->pending_retransmits_.end());
 
-  const uint32_t now = millis();
-  this->pending_retransmits_.push_back(PendingRetransmit{target_key, now + 1000, redo});
-  this->pending_retransmits_.push_back(PendingRetransmit{target_key, now + 5000, redo});
+  // Left unanchored - loop() anchors each entry's own fire_at the next time it observes the
+  // queue idle, rather than fixing it to now + delay_ms here. See this method's own header
+  // comment (fastcon_controller.h) for why.
+  this->pending_retransmits_.push_back(PendingRetransmit{target_key, 1000, false, 0, redo});
+  this->pending_retransmits_.push_back(PendingRetransmit{target_key, 5000, false, 0, redo});
 }
 
 void FastconController::loop() {
@@ -208,10 +210,40 @@ void FastconController::loop() {
   // itself call schedule_retransmits() again (nothing currently does, but a callback re-
   // entering this same vector while it is being iterated would be a use-after-free waiting to
   // happen).
+  //
+  // Anchored, and gated, on the queue actually being idle (2026-09-07, per direct request:
+  // "the retry mechanism should not queue any commands unless the queue is empty" - "the 1 and
+  // 5 second retries fire based on the queue empty time") - see schedule_retransmits()'s own
+  // header comment (fastcon_controller.h) for why a timer fixed at schedule time can fire
+  // while the burst it's protecting is still stuck behind a backlog. "Idle" here means the
+  // queue is empty AND nothing is currently mid-transmission (adv_state_ == IDLE) - not merely
+  // that nothing is left WAITING, which queue_.empty() alone would report a frame early (the
+  // instant the last queued frame is popped into the advertise/gap cycle below, before it has
+  // actually gone out over the air).
   if (!this->pending_retransmits_.empty()) {
+    bool queue_idle;
+    {
+      std::lock_guard<std::mutex> lock(queue_mutex_);
+      queue_idle = this->queue_.empty();
+    }
+    queue_idle = queue_idle && this->adv_state_ == AdvertiseState::IDLE;
+
+    // Anchor any not-yet-anchored entry's own deadline from THIS idle moment - the first one
+    // observed since it was scheduled, not from schedule time.
+    if (queue_idle) {
+      for (auto &p : this->pending_retransmits_) {
+        if (!p.anchored) {
+          p.anchored = true;
+          p.fire_at = now + p.delay_ms;
+        }
+      }
+    }
+
     std::vector<std::function<void()>> due;
     for (auto it = this->pending_retransmits_.begin(); it != this->pending_retransmits_.end();) {
-      if (it->fire_at <= now) {
+      // Only ever fires when the queue is idle right now too - never piles a retry onto a
+      // backlog that built up again in the meantime.
+      if (it->anchored && it->fire_at <= now && queue_idle) {
         due.push_back(std::move(it->redo));
         it = this->pending_retransmits_.erase(it);
       } else {

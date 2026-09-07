@@ -107,16 +107,31 @@ namespace esphome
             /// time to act on what came before it.
             void queue_settle(uint16_t ms);
 
-            /// Schedule `redo` to run again at +1s and +5s from now, in case the whole burst
-            /// just sent (membership + control, or just control for a single light) was missed
-            /// entirely - command_retries_/membership_retries_ already cover a single dropped
-            /// frame within one burst, but not a bulb that was unreachable for the whole burst
-            /// (briefly out of range, mid-relay of something else, RF interference). Added
-            /// 2026-09-03 per direct request, after confirming live that HA's own recorded
-            /// state can be correct while a bulb never actually receives anything - the
-            /// reconciler has no way to notice that (see scripts.yaml's own target_state vs
-            /// believed_state design - believed_state is written the moment a command is SENT,
-            /// not confirmed), so this is the mesh-level backstop instead.
+            /// Schedule `redo` to run again 1s and 5s after the queue is next fully idle, in
+            /// case the whole burst just sent (membership + control, or just control for a
+            /// single light) was missed entirely - command_retries_/membership_retries_
+            /// already cover a single dropped frame within one burst, but not a bulb that was
+            /// unreachable for the whole burst (briefly out of range, mid-relay of something
+            /// else, RF interference). Added 2026-09-03 per direct request, after confirming
+            /// live that HA's own recorded state can be correct while a bulb never actually
+            /// receives anything - the reconciler has no way to notice that (see scripts.yaml's
+            /// own target_state vs believed_state design - believed_state is written the moment
+            /// a command is SENT, not confirmed), so this is the mesh-level backstop instead.
+            ///
+            /// Counted from queue-idle, not from this call (2026-09-07, per direct request):
+            /// the whole premise is "wait, then check whether the mesh actually received what
+            /// was just sent" - which only means something once that burst has actually gone
+            /// out over the air. If the queue already has a backlog when this is called (a
+            /// burst of competing dispatches, see queueCommand()'s own comment), a timer fixed
+            /// at call time could elapse and fire while the burst it's protecting is still
+            /// sitting queued behind that backlog - piling yet another command onto an already
+            /// backed-up queue instead of giving the mesh a real chance to receive anything.
+            /// Each entry here instead stays unanchored until loop() next observes the queue
+            /// truly idle (empty AND not mid-transmission), anchors its own 1s/5s deadline from
+            /// THAT moment, and even once due, only actually fires - i.e., only ever calls
+            /// `redo` and lets it queue anything - the next time the queue is again observed
+            /// idle at that same check, never piling onto a live backlog. See loop()'s own
+            /// comment (fastcon_controller.cpp) for the anchor/fire mechanics.
             ///
             /// `target_key` identifies what `redo` addresses. Every caller uses the raw
             /// light_id (0-255) of the ONE physical bulb `redo` will individually re-address -
@@ -331,7 +346,22 @@ namespace esphome
             struct PendingRetransmit
             {
                 uint16_t target_key;
-                uint32_t fire_at;
+
+                /// 1000 or 5000 - which of schedule_retransmits()'s own two delays this entry
+                /// represents, counted from the queue's own next idle moment, not from
+                /// schedule time. See schedule_retransmits()'s own comment for why.
+                uint32_t delay_ms;
+
+                /// False until loop() has observed the queue idle at least once since this
+                /// entry was scheduled - only then is `fire_at` meaningful. An unanchored
+                /// entry is never due, no matter how much wall-clock time has passed.
+                bool anchored{false};
+
+                /// millis() timestamp this entry becomes due - valid only once `anchored` is
+                /// true (set the moment loop() first observes the queue idle after this entry
+                /// was scheduled, to `that moment + delay_ms`).
+                uint32_t fire_at{0};
+
                 std::function<void()> redo;
             };
             std::vector<PendingRetransmit> pending_retransmits_;
