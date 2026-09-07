@@ -225,11 +225,17 @@ void FastconController::schedule_retransmits(uint16_t target_key, std::function<
                       [target_key](const PendingRetransmit &p) { return p.target_key == target_key; }),
       this->pending_retransmits_.end());
 
+  // Configurable (2026-09-07, per direct request): OFF disables the whole safety net for
+  // this target - the erase above already ran, so any now-stale entries are still cleared,
+  // there is just nothing new scheduled to replace them.
+  if (!this->retransmit_enabled_) return;
+
   // Left unanchored - loop() anchors each entry's own fire_at the next time it observes the
   // queue idle, rather than fixing it to now + delay_ms here. See this method's own header
   // comment (fastcon_controller.h) for why.
-  this->pending_retransmits_.push_back(PendingRetransmit{target_key, 1000, false, 0, redo});
-  this->pending_retransmits_.push_back(PendingRetransmit{target_key, 5000, false, 0, redo});
+  for (uint32_t delay_ms : this->retransmit_delays_) {
+    this->pending_retransmits_.push_back(PendingRetransmit{target_key, delay_ms, false, 0, redo});
+  }
 }
 
 void FastconController::loop() {

@@ -201,9 +201,11 @@ namespace esphome
             /// request) - resending a stale value after the mesh has already been told
             /// something new would fight the new command, not help it.
             /// `redo` must capture everything it needs by VALUE (the group_id/light_id, mask,
-            /// light_data bytes, etc.) - it runs 1-5 seconds later, by which point any of this
-            /// object's own mutable state (this->members_, the light's current values) may have
-            /// moved on to something else entirely.
+            /// light_data bytes, etc.) - it runs retransmit_delays_[i] later (seconds, by
+            /// default), by which point any of this object's own mutable state
+            /// (this->members_, the light's current values) may have moved on to something
+            /// else entirely. A no-op (schedules nothing beyond the erase above) when
+            /// retransmit_enabled_ is false or retransmit_delays_ is empty.
             void schedule_retransmits(uint16_t target_key, std::function<void()> redo);
 
             void clear_queue();
@@ -221,6 +223,19 @@ namespace esphome
             void set_membership_retries(uint8_t n) { membership_retries_ = n; }
             void set_command_retries(uint8_t n) { command_retries_ = n; }
             void set_group_settle(uint16_t ms) { group_settle_ms_ = ms; }
+            /// Master switch for the +1s/+5s individual-retransmit safety net (2026-09-07,
+            /// per direct request "allow this to be configurable in yaml: allow ON or OFF").
+            /// When off, schedule_retransmits() still clears any already-superseded pending
+            /// entries for a target but never schedules new ones - the mesh then relies
+            /// solely on command_retries_/membership_retries_ (same-dispatch, back-to-back
+            /// repeats) for reliability, with nothing following up seconds later.
+            void set_retransmit_enabled(bool b) { retransmit_enabled_ = b; }
+            /// Delays (ms), counted from the queue's own next idle moment - see
+            /// PendingRetransmit::delay_ms - used in place of the old hardcoded {1000, 5000}
+            /// (2026-09-07, per direct request "allow config to define retry timings"). One
+            /// PendingRetransmit is scheduled per entry, in order; an empty vector behaves
+            /// like retransmit_enabled_ == false (nothing ever gets scheduled).
+            void set_retransmit_delays(std::vector<uint32_t> delays_ms) { retransmit_delays_ = std::move(delays_ms); }
             /// No longer affects behavior (2026-09-03) - ensure_group() rewrites membership
             /// unconditionally on every call now, see its own header comment. Kept only so the
             /// `fastcon: membership_ttl:` YAML option (fastcon_controller.py) still compiles for
@@ -417,8 +432,8 @@ namespace esphome
             {
                 uint16_t target_key;
 
-                /// 1000 or 5000 - which of schedule_retransmits()'s own two delays this entry
-                /// represents, counted from the queue's own next idle moment, not from
+                /// One entry of retransmit_delays_ (configurable, 2026-09-07 - was a hardcoded
+                /// 1000 or 5000) - counted from the queue's own next idle moment, not from
                 /// schedule time. See schedule_retransmits()'s own comment for why.
                 uint32_t delay_ms;
 
@@ -465,6 +480,9 @@ namespace esphome
             uint8_t command_retries_{3};
             uint16_t group_settle_ms_{250};
             uint16_t pending_settle_{0};
+            /// See set_retransmit_enabled()/set_retransmit_delays()'s own comments.
+            bool retransmit_enabled_{true};
+            std::vector<uint32_t> retransmit_delays_{1000, 5000};
             uint32_t membership_ttl_{30000};  // unused - see set_membership_ttl()'s own comment
             uint8_t group_slot_{0xfd};
 

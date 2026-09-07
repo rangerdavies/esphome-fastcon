@@ -19,6 +19,8 @@ CONF_GROUP_SLOT = "group_slot"
 CONF_SNIFFER = "sniffer"
 CONF_COMMAND_RETRIES = "command_retries"
 CONF_GROUP_SETTLE = "group_settle"
+CONF_RETRANSMIT_ENABLED = "retransmit_enabled"
+CONF_RETRANSMIT_DELAYS = "retransmit_delays"
 
 DEFAULT_ADV_INTERVAL_MIN = 0x20
 DEFAULT_ADV_INTERVAL_MAX = 0x40
@@ -43,6 +45,14 @@ DEFAULT_COMMAND_RETRIES = 3
 # Pause bracketing each membership write, so a bulb is not reassigned to another group
 # while it is still acting on the frame before it.
 DEFAULT_GROUP_SETTLE = "250ms"
+
+# The +1s/+5s individual-retransmit safety net (schedule_retransmits() in
+# fastcon_controller.cpp) - a follow-up resend of the last command for a target, fired
+# once the queue goes idle, independent of command_retries_/membership_retries_'s
+# same-dispatch back-to-back repeats above. On by default, matching the firmware's
+# original fixed behavior.
+DEFAULT_RETRANSMIT_ENABLED = True
+DEFAULT_RETRANSMIT_DELAYS = ["1s", "5s"]
 
 
 def validate_hex_bytes(value):
@@ -104,6 +114,12 @@ CONFIG_SCHEMA = cv.Schema(
         cv.Optional(
             CONF_GROUP_SETTLE, default=DEFAULT_GROUP_SETTLE
         ): cv.positive_time_period_milliseconds,
+        cv.Optional(
+            CONF_RETRANSMIT_ENABLED, default=DEFAULT_RETRANSMIT_ENABLED
+        ): cv.boolean,
+        cv.Optional(
+            CONF_RETRANSMIT_DELAYS, default=DEFAULT_RETRANSMIT_DELAYS
+        ): cv.ensure_list(cv.positive_time_period_milliseconds),
     }
 ).extend(cv.COMPONENT_SCHEMA).extend(esp32_ble_tracker.ESP_BLE_DEVICE_SCHEMA)
 
@@ -133,6 +149,12 @@ async def to_code(config):
     cg.add(var.set_group_slot(config[CONF_GROUP_SLOT]))
     cg.add(var.set_command_retries(config[CONF_COMMAND_RETRIES]))
     cg.add(var.set_group_settle(config[CONF_GROUP_SETTLE]))
+    cg.add(var.set_retransmit_enabled(config[CONF_RETRANSMIT_ENABLED]))
+    cg.add(
+        var.set_retransmit_delays(
+            [int(delay.total_milliseconds) for delay in config[CONF_RETRANSMIT_DELAYS]]
+        )
+    )
 
     if config[CONF_SNIFFER]:
         cg.add(var.set_sniffer_enabled(True))
