@@ -243,8 +243,11 @@ void FastconLight::write_state(light::LightState *state) {
 
     // Queue it for advertisement. `members` is this entity's own membership bitmask -
     // empty for an individual entity, which is exactly when is_group is also false, so
-    // this is equivalent to the old unconditional call in that case.
-    controller->queueCommand(addr, payload, /*repeat=*/0, is_group, members);
+    // this is equivalent to the old unconditional call in that case. Note this is the
+    // group's CONTROL frame only - its membership write already went out separately, via
+    // ensure_group() above (which queues its own CommandKind::GROUP_MEMBERSHIP command).
+    controller->queueCommand(addr, payload, /*repeat=*/0,
+                              is_group ? CommandKind::GROUP_CONTROL : CommandKind::INDIVIDUAL, members);
 
     if (is_group)
       controller->send_time_sync();

@@ -23,6 +23,21 @@ namespace esphome
     {
         class FastconLight;
 
+        /// What kind of thing a queued Command actually is (2026-09-07, per direct request
+        /// "the queue should also consider command type" - replaces the old plain `is_group`
+        /// bool on Command). A group's membership-definition frame ("group 22 = lights
+        /// 1,3,5") and a group's control frame ("group 22 -> on") both address the same
+        /// numeric `target` (the group_id) but are NOT duplicates of each other - each is
+        /// necessary and neither should ever supersede the other just because they share a
+        /// target. See queueCommand()'s own comment (fastcon_controller.cpp) for how this is
+        /// used in the supersede scan.
+        enum class CommandKind : uint8_t
+        {
+            INDIVIDUAL,        ///< target is a single light_id.
+            GROUP_MEMBERSHIP,  ///< target is a group_id; defines who is in it.
+            GROUP_CONTROL,     ///< target is a group_id; commands its current members.
+        };
+
         class FastconController : public Component
 #ifdef USE_ESP32_BLE_TRACKER
             ,
@@ -85,23 +100,32 @@ namespace esphome
             /// one time in five - which is why every working implementation of it repeats.
             /// Defaults to command_retries_ when not given; ensure_group() passes its own.
             ///
-            /// `is_group`/`group_mask` (2026-09-07) mark this dispatch as addressing a group
-            /// rather than a single light, and give that group's current membership bitmask
-            /// (same bit-packing as FastconLight::set_member_ids()/group_masks_: bit
-            /// `(id-1)%8` of byte `(id-1)/8`) - used to decide which OTHER still-queued
-            /// entries this dispatch makes stale, beyond the exact-same-target case. A group
-            /// dispatch supersedes a queued INDIVIDUAL command for one of its own members, and
-            /// a queued DIFFERENT group_id's command only when this group's membership fully
-            /// covers it (so nothing the queued frame would have addressed is left
-            /// unaddressed) - never the reverse, and never a partial/unrelated overlap. See
-            /// the supersede loop's own comment (fastcon_controller.cpp) for the exact rules.
+            /// `kind`/`group_mask` (2026-09-07, `kind` replacing the old `is_group` bool - see
+            /// CommandKind's own comment for why a plain bool stopped being enough) mark what
+            /// this dispatch actually is, and for a group kind, give that group's current
+            /// membership bitmask (same bit-packing as FastconLight::set_member_ids()/
+            /// group_masks_: bit `(id-1)%8` of byte `(id-1)/8`) - used to decide which OTHER
+            /// still-queued entries this dispatch makes stale, beyond the exact-same-target
+            /// case. Three rules (see the supersede loop's own comment, fastcon_controller.cpp,
+            /// for the exact logic):
+            ///   1. A fresh GROUP_MEMBERSHIP write for a group_id clears EVERY still-queued
+            ///      entry for that same group_id, any kind - a membership redefinition makes
+            ///      both a stale membership write AND a stale control frame from an earlier
+            ///      dispatch to the same group obsolete.
+            ///   2. Otherwise, exact same target AND same kind supersedes (a genuine repeat).
+            ///   3. A fresh GROUP_CONTROL also supersedes a queued INDIVIDUAL command for one
+            ///      of its own members, and a queued different group_id's GROUP_CONTROL only
+            ///      when this group's membership fully covers it - never the reverse, never a
+            ///      partial/unrelated overlap, and never triggered by a bare membership write
+            ///      (which carries no light state to justify a cross-target supersede).
             /// Leave `group_mask` empty for `group_id == 0` (the firmware "all lights" group,
             /// which never gets an explicit membership list) - `light_id_ == 0` alone is
             /// enough to mean "every light is a member." Leave both at their defaults for an
             /// individual dispatch, and for a non-zero group_id whose membership isn't known
             /// yet (that intentionally performs no cross-supersede rather than guessing).
             void queueCommand(uint32_t light_id_, const std::vector<uint8_t> &data, uint8_t repeat = 0,
-                               bool is_group = false, const std::vector<uint8_t> &group_mask = {});
+                               CommandKind kind = CommandKind::INDIVIDUAL,
+                               const std::vector<uint8_t> &group_mask = {});
 
             /// Queue a pause. Nothing is advertised; the queue simply idles, giving the bulbs
             /// time to act on what came before it.
@@ -276,14 +300,19 @@ namespace esphome
                 /// exception.
                 uint32_t target{0};
 
-                /// True when `target` is a group_id (this dispatch addresses every member of
-                /// that group at once), false when it is a single light_id. Lets a fresh group
-                /// dispatch's own supersede pass (queueCommand(), fastcon_controller.cpp) tell
-                /// a queued GROUP command apart from a queued INDIVIDUAL one that happens to
-                /// share the same numeric target space, so it only ever removes a queued
-                /// individual command for one of its own members, or a queued different
-                /// group's command it fully covers - never mistakes one for the other.
-                bool is_group{false};
+                /// What this entry actually is - see CommandKind's own comment. Replaces the
+                /// old plain `is_group` bool (2026-09-07): that bool could tell a group
+                /// command apart from an individual one, but not a group's OWN membership
+                /// write apart from that SAME group's control frame - both shared `is_group
+                /// == true` and the same `target` (the group_id), so the old supersede pass's
+                /// "exact same target" rule silently erased a group's still-queued membership
+                /// write the moment its control frame was queued a few milliseconds later,
+                /// EVERY time, before the membership frame ever had a chance to transmit -
+                /// confirmed live as the reason a two-group dynamic dispatch (e.g. Day Light's
+                /// 22/23) never actually worked as a group at all: every bulb, every time,
+                /// only ever heard from the +1s individual retransmit fallback, because the
+                /// group's own membership assignment was wiped before it could go out.
+                CommandKind kind{CommandKind::INDIVIDUAL};
 
                 /// This group's membership bitmask at the time it was queued (empty for an
                 /// individual command, and empty by convention for group_id 0 - see

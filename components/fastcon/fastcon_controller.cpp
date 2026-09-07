@@ -27,7 +27,7 @@ namespace fastcon {
 static const char *const TAG = "fastcon.controller";
 
 void FastconController::queueCommand(uint32_t light_id_, const std::vector<uint8_t> &data, uint8_t repeat,
-                                       bool is_group, const std::vector<uint8_t> &group_mask) {
+                                       CommandKind kind, const std::vector<uint8_t> &group_mask) {
   if (repeat == 0)
     repeat = this->command_retries_;
 
@@ -48,26 +48,42 @@ void FastconController::queueCommand(uint32_t light_id_, const std::vector<uint8
   // own header comment for why light_id_/group_id 0 specifically still needs its own
   // carve-out despite this.
   //
-  // Three rules, per direct request (2026-09-07):
-  //  1. Exact same target (same light_id vs same light_id, or same group_id vs same
-  //     group_id) - unconditional, as before.
-  //  2. A fresh GROUP dispatch supersedes a queued INDIVIDUAL command for one of ITS OWN
-  //     members. The reverse never happens - an incoming individual command never
+  // Rules, per direct request (2026-09-07, revised same day - see CommandKind's own
+  // comment for the live-confirmed bug the revision fixes: a group's membership write and
+  // its control frame share a target but are NOT duplicates of each other, and the
+  // original "exact same target, unconditional" rule 1 below used to erase the membership
+  // write the instant its own control frame was queued a few ms later, every time, before
+  // the membership frame could ever transmit - the mesh's OWN group semantics never
+  // actually worked, only the +1s individual retransmit fallback ever reached a bulb):
+  //  1. A fresh GROUP_MEMBERSHIP write for a group_id clears EVERY still-queued entry for
+  //     that SAME group_id, regardless of kind - a membership redefinition makes a
+  //     still-queued membership write from an earlier dispatch to the same group pointless
+  //     (this one is about to redefine the same thing) AND a still-queued control frame
+  //     for that group stale (it was built against whatever membership existed before this
+  //     rewrite, which is about to change under it) - both should go, not just one.
+  //  2. Otherwise, exact same target AND same kind supersedes - a genuine repeat (e.g. a
+  //     second control-frame dispatch for the same group before the first one drained).
+  //  3. A fresh GROUP_CONTROL also supersedes a queued INDIVIDUAL command for one of ITS
+  //     OWN members. The reverse never happens - an incoming individual command never
   //     supersedes a queued group command, even for a member of that group - since
   //     discarding a queued individual command never drops state for any other light.
-  //  3. A fresh GROUP dispatch supersedes a queued command for a DIFFERENT group_id only
-  //     when this group's membership fully COVERS the queued group's (a strict superset or
-  //     equal set) - never on a partial/unrelated overlap. A partial overlap is left alone:
-  //     discarding it would drop the queued group's effect on whichever of its members
-  //     aren't also in the new group, which nothing here would ever re-address.
+  //  4. A fresh GROUP_CONTROL also supersedes a queued DIFFERENT group_id's GROUP_CONTROL
+  //     only when this group's membership fully COVERS the queued group's (a strict
+  //     superset or equal set) - never on a partial/unrelated overlap. A partial overlap is
+  //     left alone: discarding it would drop the queued group's effect on whichever of its
+  //     members aren't also in the new group, which nothing here would ever re-address. A
+  //     bare membership write never triggers this rule - it carries no light state, so
+  //     there is nothing for a queued group's control frame to be made redundant by.
   size_t superseded = 0;
   for (auto it = this->queue_.begin(); it != this->queue_.end();) {
     bool erase = false;
     if (!it->data.empty()) {
-      if (it->target == light_id_) {
+      if (kind == CommandKind::GROUP_MEMBERSHIP && it->target == light_id_) {
         erase = true;  // rule 1
-      } else if (is_group && !it->is_group) {
-        // rule 2
+      } else if (it->target == light_id_ && it->kind == kind) {
+        erase = true;  // rule 2
+      } else if (kind == CommandKind::GROUP_CONTROL && it->kind == CommandKind::INDIVIDUAL) {
+        // rule 3
         if (light_id_ == 0) {
           erase = true;  // group 0 ("all lights") includes every bulb
         } else if (!group_mask.empty() && it->target >= 1) {
@@ -75,8 +91,8 @@ void FastconController::queueCommand(uint32_t light_id_, const std::vector<uint8
           if (byte < group_mask.size() && (group_mask[byte] & (1 << ((it->target - 1) % 8))))
             erase = true;
         }
-      } else if (is_group && it->is_group) {
-        // rule 3
+      } else if (kind == CommandKind::GROUP_CONTROL && it->kind == CommandKind::GROUP_CONTROL) {
+        // rule 4
         if (light_id_ == 0 && it->target != 0) {
           erase = true;  // group 0 is a superset of every other group by definition
         } else if (light_id_ != 0 && it->target != 0 && !group_mask.empty() && !it->group_mask.empty()) {
@@ -112,7 +128,7 @@ void FastconController::queueCommand(uint32_t light_id_, const std::vector<uint8
     Command cmd;
     cmd.data = data;
     cmd.target = light_id_;
-    cmd.is_group = is_group;
+    cmd.kind = kind;
     cmd.group_mask = group_mask;
     cmd.timestamp = millis();
     cmd.retries = 0;
@@ -597,7 +613,7 @@ void FastconController::ensure_group(uint8_t group_id, const std::vector<uint8_t
   this->queue_settle(this->group_settle_ms_);
   // Pass the membership retry count explicitly: queueCommand defaults to
   // command_retries_, and letting both apply would send this nine times.
-  this->queueCommand(group_id, adv_data, this->membership_retries_, /*is_group=*/true, /*group_mask=*/mask);
+  this->queueCommand(group_id, adv_data, this->membership_retries_, CommandKind::GROUP_MEMBERSHIP, mask);
   this->queue_settle(this->group_settle_ms_);
 
   this->group_masks_[group_id] = GroupState{mask, millis()};
@@ -674,7 +690,7 @@ void FastconController::dynamic_group_command(uint8_t group_id, const std::vecto
     this->send_time_sync();
     this->ensure_group(group_id, mask);
     auto payload = this->group_control(group_id, light_data);
-    this->queueCommand(group_id, payload, /*repeat=*/0, /*is_group=*/true, /*group_mask=*/mask);
+    this->queueCommand(group_id, payload, /*repeat=*/0, CommandKind::GROUP_CONTROL, mask);
     this->send_time_sync();
 
     // The group frame is on its way; now make the individual entities agree with it, so a
