@@ -19,7 +19,7 @@
 #include "utils.h"
 
 #ifndef FASTCON_VERSION
-#define FASTCON_VERSION "0.3.8-dev"
+#define FASTCON_VERSION "0.3.9-dev"
 #endif
 
 namespace esphome {
@@ -732,8 +732,24 @@ std::vector<uint8_t> FastconController::set_group_members(uint8_t group_id, cons
 }
 
 void FastconController::ensure_group(uint8_t group_id, const std::vector<uint8_t> &mask) {
-  if (mask.empty())
-    return;  // group is managed elsewhere (id 0, or defined in the app)
+  // Explicit-only since 2026-09-07 - reached from fastcon.define_group and nothing else.
+  // queueGroupCommand() used to call this on every group command; see its own comment for
+  // why that was wrong.
+  if (group_id == 0) {
+    // Firmware-owned "all lights". It has no membership to write and cannot be redefined,
+    // so there is nothing this could do even in principle.
+    ESP_LOGW(TAG, "Group 0 is the firmware's all-lights group and cannot be provisioned");
+    return;
+  }
+
+  // An empty mask now DISSOLVES a cmd-1 group rather than meaning "nothing to do": every
+  // bulb reporting this group gets `21 <id> 00`. That is only reachable deliberately now
+  // that this is an explicit call - while it ran on every group command, an empty mask had
+  // to mean "leave it alone" or an app-made group would have been torn down by the first
+  // command sent to it. The scratch slot keeps the old no-op, since cmd 5 has no way to
+  // express an empty set.
+  if (mask.empty() && group_id == SCRATCH_GROUP_ID)
+    return;
 
   // Narrow the write to only members NOT already tracked as being in THIS group
   // (2026-09-07, per direct request: "the only purpose to tracking the groupId was to
@@ -845,12 +861,21 @@ void FastconController::ensure_group(uint8_t group_id, const std::vector<uint8_t
 
 std::vector<uint8_t> FastconController::queueGroupCommand(uint8_t group_id, const std::vector<uint8_t> &mask,
                                                              const std::vector<uint8_t> &light_data) {
-  // Membership half of the set - no-ops on its own (empty mask: group_id 0, or a group_id
-  // with no known members yet) exactly as it always has.
-  this->ensure_group(group_id, mask);
-  // Control half - queued as CommandKind::GROUP_CONTROL, linked to the membership half above
-  // by sharing the same group_id target. See queueCommand()'s own comment for how the two
-  // are kept superseded together once queued.
+  // Control only. Commanding a group NO LONGER provisions it (2026-09-07, per direct
+  // request: "remove that code as implicitly called; explicit calls to create a group can be
+  // reached via the api"). ensure_group() used to run from here on every single group
+  // command, which is not what the mesh wants and not what the phone app does - the app
+  // provisions a group once, when you create it, and from then on sends nothing but cmd 3.
+  // Re-provisioning on every command put the one fragile step on the critical path of every
+  // dispatch, for no gain.
+  //
+  // `mask` is still taken and still forwarded to queueCommand(), where it feeds the
+  // supersede rules - describing who the group contains, not asserting it. For a group this
+  // component never provisioned (an app-made one) the caller can pass none and queueCommand()
+  // reconstructs it from bulb heartbeats.
+  //
+  // Provisioning is now reached only through fastcon.define_group. A group must exist before
+  // a command to it will do anything.
   auto payload = this->group_control(group_id, light_data);
   this->queueCommand(group_id, payload, /*repeat=*/0, CommandKind::GROUP_CONTROL, mask);
   return payload;

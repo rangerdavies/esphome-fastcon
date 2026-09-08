@@ -6,6 +6,7 @@
 #include <mutex>
 #include <vector>
 #include "esphome/core/component.h"
+#include "esphome/core/automation.h"
 #include "esphome/core/defines.h"
 #include "esphome/components/esp32_ble_server/ble_server.h"
 #ifdef USE_ESP32_BLE_TRACKER
@@ -621,6 +622,50 @@ namespace esphome
             /// groups it keeps. Driving a dedicated id with cmd 5 was the 2026-09-07 bug: the
             /// frames were byte-perfect and the bulbs simply never enrolled.
             static const uint8_t SCRATCH_GROUP_ID = 0xfd;
+        };
+
+        /// `fastcon.define_group` - the only way to provision a group (2026-09-07, per direct
+        /// request: "explicit calls to create a group can be reached via the api").
+        ///
+        /// Commanding a group no longer defines it. That split matches the mesh: the phone app
+        /// provisions a group once, when you create it, and afterwards sends nothing but cmd 3.
+        /// Doing it on every command put the one fragile step on the critical path of every
+        /// dispatch.
+        ///
+        /// An EMPTY member list dissolves the group - every bulb reporting it is assigned back
+        /// to group 0. group_id 0 is rejected at config time; it is the firmware's own
+        /// all-lights group and has no membership to write.
+        template<typename... Ts> class DefineGroupAction : public Action<Ts...>
+        {
+        public:
+            explicit DefineGroupAction(FastconController *parent) : parent_(parent) {}
+
+            TEMPLATABLE_VALUE(uint8_t, group_id)
+            TEMPLATABLE_VALUE(std::vector<int32_t>, members)
+
+            void play(Ts... x) override
+            {
+                const uint8_t group_id = this->group_id_.value(x...);
+                // Same packing every other mask in this component uses: bit N of byte K is
+                // light_id 8K+N+1.
+                std::vector<uint8_t> mask;
+                for (int32_t id : this->members_.value(x...))
+                {
+                    if (id < 1 || id > 255)
+                    {
+                        ESP_LOGW("fastcon.controller", "define_group: ignoring out-of-range light id %d", (int) id);
+                        continue;
+                    }
+                    const size_t byte = (size_t) (id - 1) / 8;
+                    if (mask.size() <= byte)
+                        mask.resize(byte + 1, 0);
+                    mask[byte] |= 1 << ((id - 1) % 8);
+                }
+                this->parent_->ensure_group(group_id, mask);
+            }
+
+        protected:
+            FastconController *parent_;
         };
 
     } // namespace fastcon

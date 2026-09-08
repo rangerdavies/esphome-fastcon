@@ -6,7 +6,7 @@
 #include "fastcon_light.h"
 
 #ifndef FASTCON_VERSION
-#define FASTCON_VERSION "0.3.8-dev"
+#define FASTCON_VERSION "0.3.9-dev"
 #endif
 
 namespace esphome {

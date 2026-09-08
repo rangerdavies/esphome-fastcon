@@ -1,4 +1,5 @@
 import esphome.codegen as cg
+from esphome import automation
 from esphome.components import esp32_ble_tracker
 from esphome.components import time as time_
 import esphome.config_validation as cv
@@ -190,3 +191,64 @@ async def to_code(config):
     if CONF_TIME_ID in config:
         time_var = await cg.get_variable(config[CONF_TIME_ID])
         cg.add(var.set_time_source(time_var))
+
+
+# fastcon.define_group - the only way to provision a group (2026-09-07, per direct request
+# "explicit calls to create a group can be reached via the api").
+#
+# Commanding a group no longer defines it: queueGroupCommand() used to call ensure_group() on
+# every group command, which put the one fragile step of the whole dispatch on the critical
+# path of every command. The phone app provisions a group once, when you create it, and
+# afterwards sends nothing but cmd 3 - see DefineGroupAction (fastcon_controller.h).
+#
+#   api:
+#     actions:
+#       - action: define_group
+#         variables:
+#           group_id: int
+#           members: int[]
+#         then:
+#           - fastcon.define_group:
+#               group_id: !lambda 'return group_id;'
+#               members: !lambda 'return members;'
+#
+# An empty `members` list dissolves the group. group_id 0 is rejected here rather than at
+# runtime - it is the firmware's own all-lights group and has no membership to write.
+CONF_GROUP_ID = "group_id"
+CONF_MEMBERS = "members"
+CONF_CONTROLLER_ID = "controller_id"
+MAX_LIGHT_ID = 255
+
+DefineGroupAction = fastcon_ns.class_("DefineGroupAction", automation.Action)
+
+
+@automation.register_action(
+    "fastcon.define_group",
+    DefineGroupAction,
+    cv.Schema(
+        {
+            cv.Optional(CONF_CONTROLLER_ID, default="fastcon_controller"): cv.use_id(
+                FastconController
+            ),
+            cv.Required(CONF_GROUP_ID): cv.templatable(
+                cv.int_range(min=1, max=MAX_LIGHT_ID)
+            ),
+            cv.Required(CONF_MEMBERS): cv.templatable(
+                cv.ensure_list(cv.int_range(min=1, max=MAX_LIGHT_ID))
+            ),
+        }
+    ),
+    # play() only packs a mask and queues frames - nothing is deferred to a timer, callback
+    # or loop(), so play_next_() always runs before play_complex() returns.
+    synchronous=True,
+)
+async def define_group_action_to_code(config, action_id, template_arg, args):
+    parent = await cg.get_variable(config[CONF_CONTROLLER_ID])
+    var = cg.new_Pvariable(action_id, template_arg, parent)
+    group_id = await cg.templatable(config[CONF_GROUP_ID], args, cg.uint8)
+    cg.add(var.set_group_id(group_id))
+    members = await cg.templatable(
+        config[CONF_MEMBERS], args, cg.std_vector.template(cg.int32)
+    )
+    cg.add(var.set_members(members))
+    return var
