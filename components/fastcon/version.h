@@ -1,4 +1,4 @@
 
 #pragma once
 
-#define FASTCON_VERSION "0.3.7-dev"
+#define FASTCON_VERSION "0.3.8-dev"

@@ -22,6 +22,10 @@ namespace esphome
     namespace fastcon
     {
         class FastconLight;
+        /// Forward-declared, never included: sensor.py registers each one, so this header
+        /// only ever needs the pointer type. Keeps fastcon_group_sensor.h's dependency on
+        /// this header at zero rather than mutual.
+        class FastconGroupSensor;
 
         /// What kind of thing a queued Command actually is (2026-09-07, per direct request
         /// "the queue should also consider command type" - replaces the old plain `is_group`
@@ -76,6 +80,18 @@ namespace esphome
             std::vector<uint8_t> get_white_light_data(light::LightState *state);
             std::vector<uint8_t> single_control(uint32_t addr, const std::vector<uint8_t> &light_data);
             std::vector<uint8_t> group_control(uint8_t group_id, const std::vector<uint8_t> &light_data);
+            /// Which group a bulb says it is in, or -1 if it has never been heard from.
+            /// Sourced from heartbeats, so this answers "where is this bulb" and not "where
+            /// did we ask it to be" - the two disagreeing is the failure mode the heartbeat
+            /// decode exists to expose. Needs `sniffer: true`.
+            int group_of(uint8_t light_id) const;
+
+            /// Every bulb currently reporting `group_id`. Empty if none have been heard from,
+            /// which is NOT the same as the group being empty.
+            std::vector<uint8_t> lights_in_group(uint8_t group_id) const;
+
+            void register_group_sensor(FastconGroupSensor *s) { this->group_sensors_.push_back(s); }
+
             std::vector<uint8_t> set_group_members(uint8_t group_id, const std::vector<uint8_t> &mask);
 
             /// cmd 1 - `21 <light_id> <group_id>`, group_id 0 meaning "no group". This is how
@@ -385,6 +401,13 @@ namespace esphome
             /// member. Evictions go first so a departing bulb stops answering before the
             /// control frame this is provisioning for goes out.
             void assign_group_members_cmd1_(uint8_t group_id, const std::vector<uint8_t> &mask);
+
+            /// Rebuild a group's member mask from what the bulbs have reported. Used by
+            /// queueCommand() for a PRE-DEFINED group, which arrives with no mask of its own
+            /// because commanding one takes cmd 3 alone - see that method's own comment.
+            std::vector<uint8_t> mask_from_observed_(uint8_t group_id) const;
+
+            std::vector<FastconGroupSensor *> group_sensors_;
 
             /// Remember an inner payload we are about to transmit. The bulbs RELAY every
             /// frame (confirmed live 2026-09-03: six distinct BLE addresses, one per bulb,

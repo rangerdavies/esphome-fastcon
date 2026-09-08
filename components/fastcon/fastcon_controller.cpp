@@ -14,11 +14,12 @@
 #endif
 #include "fastcon_controller.h"
 #include "fastcon_light.h"
+#include "fastcon_group_sensor.h"
 #include "protocol.h"
 #include "utils.h"
 
 #ifndef FASTCON_VERSION
-#define FASTCON_VERSION "0.3.7-dev"
+#define FASTCON_VERSION "0.3.8-dev"
 #endif
 
 namespace esphome {
@@ -32,6 +33,27 @@ void FastconController::queueCommand(uint32_t light_id_, const std::vector<uint8
     repeat = this->command_retries_;
 
   std::lock_guard<std::mutex> lock(queue_mutex_);
+
+  // Three dispatch shapes reach this queue and all three have to supersede correctly:
+  // an individual command, an ad-hoc group this component provisions itself (so the caller
+  // hands over the mask it just wrote), and a PRE-DEFINED group - one the phone app created,
+  // which is commanded with cmd 3 alone and therefore arrives with no mask at all.
+  //
+  // That third shape used to fall out of rules 3 and 4 entirely, both of which require a
+  // non-empty mask: a pre-defined group's command supserseded nothing, so a queued individual
+  // command for one of its members would still play out afterwards and undo it. Since 0.3.6
+  // the bulbs' own heartbeats tell us who is in which group, so the mask can simply be
+  // reconstructed from what they reported. Derived only when the caller supplied none, and
+  // only when it yields something - an unknown group stays maskless and keeps the old
+  // conservative behaviour rather than guessing at an empty membership.
+  std::vector<uint8_t> derived_mask;
+  if (kind == CommandKind::GROUP_CONTROL && group_mask.empty() && light_id_ > 0 && light_id_ < 256) {
+    derived_mask = this->mask_from_observed_((uint8_t) light_id_);
+    if (!derived_mask.empty())
+      ESP_LOGD(TAG, "Group %u has no supplied mask; using observed membership (%u bulb(s))",
+               (unsigned) light_id_, (unsigned) derived_mask.size());
+  }
+  const std::vector<uint8_t> &effective_mask = derived_mask.empty() ? group_mask : derived_mask;
 
   // Supersede stale queued frames this dispatch makes obsolete (2026-09-07) - closes a
   // backlog window a live queue-depth diagnostic caught directly: a burst of competing
@@ -106,20 +128,20 @@ void FastconController::queueCommand(uint32_t light_id_, const std::vector<uint8
         // rule 3
         if (light_id_ == 0) {
           erase = true;  // group 0 ("all lights") includes every bulb
-        } else if (!group_mask.empty() && it->target >= 1) {
+        } else if (!effective_mask.empty() && it->target >= 1) {
           const size_t byte = (size_t) (it->target - 1) / 8;
-          if (byte < group_mask.size() && (group_mask[byte] & (1 << ((it->target - 1) % 8))))
+          if (byte < effective_mask.size() && (effective_mask[byte] & (1 << ((it->target - 1) % 8))))
             erase = true;
         }
       } else if (kind == CommandKind::GROUP_CONTROL && it->kind == CommandKind::GROUP_CONTROL) {
         // rule 4
         if (light_id_ == 0 && it->target != 0) {
           erase = true;  // group 0 is a superset of every other group by definition
-        } else if (light_id_ != 0 && it->target != 0 && !group_mask.empty() && !it->group_mask.empty()) {
+        } else if (light_id_ != 0 && it->target != 0 && !effective_mask.empty() && !it->group_mask.empty()) {
           bool superset = true;
           for (size_t byte = 0; byte < it->group_mask.size() && superset; byte++) {
             const uint8_t theirs = it->group_mask[byte];
-            const uint8_t ours = byte < group_mask.size() ? group_mask[byte] : 0;
+            const uint8_t ours = byte < effective_mask.size() ? effective_mask[byte] : 0;
             if ((theirs & ours) != theirs)
               superset = false;
           }
@@ -162,7 +184,7 @@ void FastconController::queueCommand(uint32_t light_id_, const std::vector<uint8
     cmd.data = data;
     cmd.target = light_id_;
     cmd.kind = kind;
-    cmd.group_mask = group_mask;
+    cmd.group_mask = effective_mask;
     cmd.timestamp = millis();
     cmd.retries = 0;
     queue_.push_back(cmd);
@@ -1102,6 +1124,29 @@ bool FastconController::parse_device(const ble_device_base::ESPBTDevice &device)
 }
 #endif
 
+std::vector<uint8_t> FastconController::mask_from_observed_(uint8_t group_id) const {
+  std::vector<uint8_t> mask;
+  for (const auto &entry : this->observed_light_group_) {
+    if (entry.second != group_id || entry.first < 1)
+      continue;
+    const size_t byte = (size_t) (entry.first - 1) / 8;
+    if (mask.size() <= byte)
+      mask.resize(byte + 1, 0);
+    mask[byte] |= 1 << ((entry.first - 1) % 8);
+  }
+  return mask;
+}
+
+int FastconController::group_of(uint8_t light_id) const { return this->observed_group_of(light_id); }
+
+std::vector<uint8_t> FastconController::lights_in_group(uint8_t group_id) const {
+  std::vector<uint8_t> ids;
+  for (const auto &entry : this->observed_light_group_)
+    if (entry.second == group_id)
+      ids.push_back(entry.first);
+  return ids;
+}
+
 void FastconController::handle_heartbeat_(const std::vector<uint8_t> &hb) {
   const uint8_t light_id = hb[5];
   const uint8_t group_id = hb[6];
@@ -1119,6 +1164,10 @@ void FastconController::handle_heartbeat_(const std::vector<uint8_t> &hb) {
   } else {
     ESP_LOGD(TAG, "HEARTBEAT light %u is in group %u", (unsigned) light_id, (unsigned) group_id);
   }
+
+  for (auto *s : this->group_sensors_)
+    if (s->get_light_id() == light_id)
+      s->publish_group(group_id);
 }
 
 void FastconController::handle_sniffed_payload_(const std::vector<uint8_t> &payload) {
