@@ -14,12 +14,23 @@
 #endif
 #include "fastcon_controller.h"
 #include "fastcon_light.h"
+// USE_SENSOR is only defined (and esphome/components/sensor/*'s sources only added to the
+// build) when a `sensor:` platform is actually configured somewhere in the device's YAML -
+// this device (brmesh-bridge.yaml) declares no `sensor: platform: fastcon` entities, so
+// without this guard the build fails outright: fastcon_group_sensor.h unconditionally
+// includes esphome/components/sensor/sensor.h, which does not exist in a build that never
+// pulled the sensor component in. Same pattern as the USE_TIME guard just above. group_id
+// is still tracked in observed_light_group_ either way (handle_heartbeat_()'s own comment) -
+// this only gates PUBLISHING it onto a FastconGroupSensor entity, which requires one to
+// exist in the first place.
+#ifdef USE_SENSOR
 #include "fastcon_group_sensor.h"
+#endif
 #include "protocol.h"
 #include "utils.h"
 
 #ifndef FASTCON_VERSION
-#define FASTCON_VERSION "0.3.9-dev"
+#define FASTCON_VERSION "0.3.10-dev"
 #endif
 
 namespace esphome {
@@ -1264,9 +1275,11 @@ void FastconController::handle_heartbeat_(const std::vector<uint8_t> &hb) {
     ESP_LOGD(TAG, "HEARTBEAT light %u is in group %u", (unsigned) light_id, (unsigned) group_id);
   }
 
+#ifdef USE_SENSOR
   for (auto *s : this->group_sensors_)
     if (s->get_light_id() == light_id)
       s->publish_group(group_id);
+#endif
 }
 
 void FastconController::handle_sniffed_payload_(const std::vector<uint8_t> &payload) {

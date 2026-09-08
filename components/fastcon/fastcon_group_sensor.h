@@ -1,5 +1,19 @@
 #pragma once
 
+// USE_SENSOR-gated for the whole file, not just this include (2026-09-07, after a real
+// compile failure) - ESPHome's generated `esphome.h` aggregates every header out of a used
+// component's directory unconditionally, regardless of which platforms that component's
+// config actually declares, and unconditionally #includes each one. A device using
+// `light: platform: fastcon` with no `sensor: platform: fastcon` entities anywhere (e.g.
+// brmesh-bridge.yaml) never gets the `sensor` component pulled into its build at all, so
+// `esphome/components/sensor/sensor.h` does not exist for it to find - guarding just the
+// include inside fastcon_controller.cpp (which also needed its own USE_SENSOR guard, see
+// that file) was not enough, since the generated aggregator reaches this file directly,
+// not through that one. Wrapping the whole file - not only the `sensor.h` include - means a
+// build with no sensor platform anywhere gets an effectively empty translation unit here
+// instead of a fatal error.
+#ifdef USE_SENSOR
+
 #include "esphome/core/component.h"
 #include "esphome/core/log.h"
 #include "esphome/components/sensor/sensor.h"
@@ -42,3 +56,5 @@ class FastconGroupSensor : public sensor::Sensor, public Component {
 
 }  // namespace fastcon
 }  // namespace esphome
+
+#endif  // USE_SENSOR
