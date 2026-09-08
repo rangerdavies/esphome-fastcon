@@ -145,30 +145,58 @@ namespace esphome
             /// configured or the clock hasn't synced yet.
             void send_time_sync();
 
-            /// Define (or redefine) an arbitrary group's membership and command it directly, with
-            /// no backing `platform: fastcon` light entity and no light::LightState* - the caller
-            /// (an `api: actions:` lambda, see brmesh-bridge.yaml) supplies every light_data byte
-            /// already computed. `members` are raw mesh light_ids (1-based, matching
-            /// set_group_members()'s own numbering - NOT the HA-facing "Light N" numbering used
-            /// in scripts.yaml, same caveat as every other members: list in this repo).
-            /// `group_id` must not collide with a group_id already owned by a static entity (0 is
-            /// firmware-owned "all"; any group_id used by a `platform: fastcon` entity in YAML is
-            /// that entity's own) or the shared group_slot - pick an unused id per ad-hoc group.
-            /// `group_id == 0` is explicitly safe to pass, though: it's treated as the same
-            /// firmware-owned "all" group static entities use, and `members` is silently ignored
-            /// for it (no membership write is ever attempted) - a caller wanting group 0 can still
-            /// pass every member id, purely for its own target_state/believed_state bookkeeping.
+            /// Command an arbitrary, ad-hoc set of lights with no backing `platform: fastcon`
+            /// light entity and no light::LightState* - the caller (an `api: actions:` lambda,
+            /// see brmesh-bridge.yaml) supplies every light_data byte already computed.
+            /// `members` are raw mesh light_ids (1-based, matching set_group_members()'s own
+            /// numbering - NOT the HA-facing "Light N" numbering used in scripts.yaml, same
+            /// caveat as every other members: list in this repo).
+            ///
+            /// ALWAYS targets SCRATCH_GROUP_ID (0xfd/253), the app's own ad-hoc scratch slot -
+            /// no `group_id` parameter (2026-09-07, per direct request "dynamic groups define
+            /// members... but not the group id because on the esphome side it should always use
+            /// group id 253 with cmd 5"). A caller that wants a STABLE, repeatable subset should
+            /// define it once with `fastcon: groups:` (provisioned at boot with cmd 1, see
+            /// setup()'s own comment) and command it afterward with command_static_group()
+            /// instead - that path needs no membership write per call and does not fight this
+            /// one for the shared slot. This method re-provisions `members` via ensure_group()
+            /// on every single call (unlike command_static_group()), because that is the whole
+            /// point of "dynamic": the set can be different every time, and cmd 5 (unlike cmd 1)
+            /// has no persistent "who's in this" the mesh remembers between calls.
             /// `brightness` is 0-127 (the wire scale, already divided down from HA's 0-255 - see
             /// this method's own .cpp comment for why no scaling happens here). `blue`/`red`/
             /// `green`/`warm`/`cold` are each 0-255, matching get_light_data()'s own wire format.
-            /// Same queueGroupCommand()+send_time_sync() sequence as FastconLight::write_state()'s
-            /// own group path (fastcon_light.cpp) - deliberately not factored into a shared
-            /// helper beyond queueGroupCommand() itself, to keep that entity-bound path
-            /// untouched by this one.
-            void dynamic_group_command(uint8_t group_id, const std::vector<uint8_t> &members,
+            void dynamic_group_command(const std::vector<uint8_t> &members,
                                         bool state, uint8_t brightness,
                                         uint8_t blue, uint8_t red, uint8_t green,
                                         uint8_t warm, uint8_t cold);
+
+            /// Command a PRE-DEFINED, permanent group by `group_id` alone - no `members`, and no
+            /// membership write of any kind (2026-09-07, per direct request "pre-defined groups
+            /// have a groupId and member lights defined in brmesh-bridge... automations and
+            /// scripts only use the groupId"). Its membership lives entirely in `fastcon:
+            /// groups:` config and was written once, at boot, with cmd 1 - see setup()'s own
+            /// comment and add_static_group() below. This sends nothing but a cmd-3 control
+            /// frame, matching how the phone app commands a group it already created. Logs a
+            /// warning and still sends the control frame (which will reach nothing, since no
+            /// bulb was ever told to join) if `group_id` was never registered via
+            /// add_static_group() - almost certainly a config/call-site mismatch, not something
+            /// to silently swallow.
+            void command_static_group(uint8_t group_id, bool state, uint8_t brightness,
+                                        uint8_t blue, uint8_t red, uint8_t green,
+                                        uint8_t warm, uint8_t cold);
+
+            /// Register a permanent group from `fastcon: groups:` config (fastcon_controller.py)
+            /// - `members` are raw mesh light_ids, same numbering as everywhere else in this
+            /// component. Only records the definition; setup() is what actually provisions it on
+            /// the mesh (cmd 1, once, at boot) - see that method's own comment for why splitting
+            /// "define" from "provision" this way still leaves exactly one write per group per
+            /// boot, matching fastcon.define_group's own explicit-provisioning design
+            /// (DefineGroupAction, this header) rather than reintroducing a per-command rewrite.
+            void add_static_group(uint8_t group_id, std::vector<uint8_t> members)
+            {
+                this->static_group_members_[group_id] = std::move(members);
+            }
 
             /// Queue a frame for advertisement, repeated `repeat` times. Reception on this
             /// protocol is roughly 80%% per advertisement, so a single shot loses a bulb about
@@ -581,7 +609,18 @@ namespace esphome
             /// (2026-09-03: no longer used to skip a rewrite, see ensure_group()'s own
             /// comment - these bulbs hold one group assignment each, so "we wrote it recently"
             /// says nothing about whether a DIFFERENT group_id's write has since evicted it).
+            /// Doubles as command_static_group()'s own source for a permanent group's mask
+            /// (populated by setup()'s own boot-time provisioning loop, same map every other
+            /// group write already updates) - no separate mask cache needed for the static path.
             std::map<uint8_t, GroupState> group_masks_;
+
+            /// Raw mesh light_ids for each permanent group's own known members, keyed by
+            /// group_id - populated at compile time from `fastcon: groups:` config
+            /// (add_static_group(), this header) and provisioned once, at setup(), with cmd 1.
+            /// command_static_group() reads this for its own +1s/+5s individual-retransmit
+            /// fallback (schedule_retransmits() needs the raw member list, not just the mask -
+            /// same reason dynamic_group_command() keeps `members` around alongside its mask).
+            std::map<uint8_t, std::vector<uint8_t>> static_group_members_;
             uint8_t membership_retries_{3};
             uint8_t command_retries_{3};
             uint16_t group_settle_ms_{250};

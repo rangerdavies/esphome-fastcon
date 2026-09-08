@@ -228,6 +228,35 @@ void FastconController::setup() {
   ESP_LOGCONFIG(TAG, "  Advertisement interval: %d-%d", this->adv_interval_min_, this->adv_interval_max_);
   ESP_LOGCONFIG(TAG, "  Advertisement duration: %dms", this->adv_duration_);
   ESP_LOGCONFIG(TAG, "  Advertisement gap: %dms", this->adv_gap_);
+
+  // Provision every permanent group from `fastcon: groups:` config, once, at boot
+  // (2026-09-07, per direct request "on start-up the esp32 device should write these
+  // permanent groups to the lights"). Same ensure_group() a real group always goes through
+  // (cmd 1, since group_id != SCRATCH_GROUP_ID) - this is just the one deliberate call site
+  // that runs it automatically instead of waiting for an explicit fastcon.define_group
+  // action. After this, command_static_group() only ever sends a bare cmd-3 control frame -
+  // membership already lives on the bulbs and is not rewritten again unless the device
+  // reboots. All `set_*()`/add_static_group() config-time setters have already run by the
+  // time App.setup() calls this (they are plain field writers generated straight into
+  // main.cpp's setup(), executed before component setup() callbacks), so
+  // static_group_members_ is fully populated here.
+  for (const auto &kv : this->static_group_members_) {
+    const uint8_t group_id = kv.first;
+    const std::vector<uint8_t> &members = kv.second;
+    std::vector<uint8_t> mask;
+    for (uint8_t id : members) {
+      if (id < 1) {
+        ESP_LOGW(TAG, "Static group %u: ignoring out-of-range member id %u", (unsigned) group_id, (unsigned) id);
+        continue;
+      }
+      const size_t byte = (size_t) (id - 1) / 8;
+      if (mask.size() <= byte)
+        mask.resize(byte + 1, 0);
+      mask[byte] |= 1 << ((id - 1) % 8);
+    }
+    ESP_LOGCONFIG(TAG, "  Provisioning permanent group %u (%zu member(s))", (unsigned) group_id, members.size());
+    this->ensure_group(group_id, mask);
+  }
 }
 
 // esp_reset_reason() names, for the heartbeat log below - esp_err_to_name()-style helper
@@ -894,34 +923,29 @@ std::vector<uint8_t> FastconController::queueGroupCommand(uint8_t group_id, cons
 // exactly one place color math happens for BrMesh commands overall right now: HA-side Jinja,
 // auditable and adjustable without a firmware recompile - see
 // docs/fastcongroupconfig.md's "Dynamic groups (api action)" section for the exact formula.
-void FastconController::dynamic_group_command(uint8_t group_id, const std::vector<uint8_t> &members,
+void FastconController::dynamic_group_command(const std::vector<uint8_t> &members,
                                                 bool state, uint8_t brightness,
                                                 uint8_t blue, uint8_t red, uint8_t green,
                                                 uint8_t warm, uint8_t cold) {
+  // ALWAYS the scratch slot (2026-09-07, per direct request - see this method's own header
+  // comment). No `group_id` parameter any more: a dynamic caller supplies `members` only, and
+  // this method owns picking the mechanism (cmd 5, scratch slot) that fits an ad-hoc set.
+  static constexpr uint8_t group_id = SCRATCH_GROUP_ID;
+
   // Same bitmask packing as FastconLight::set_member_ids() (fastcon_light.cpp) - bit N of
   // byte K addresses light_id 8K+N+1 - duplicated rather than shared because that method
   // lives on an entity (mutates this->members_, re-applies last_state_) and this path has
   // neither; both independently match docs/fastcongroupconfig.md's documented mask rule.
-  //
-  // group_id 0 is firmware-owned ("all lights") and never gets a membership write, same
-  // rule light.py's _validate_addressing() enforces at compile time for a static entity
-  // (`group_id: 0` + `members:` together is a config error there) - enforced here too,
-  // defensively, since a dynamic caller has no such compile-time check. A caller wanting
-  // group 0 (e.g. living_room_lights_evening, scripts.yaml) can still pass all 6 member
-  // ids for its own target_state/believed_state bookkeeping; the mask is simply never
-  // computed or written for this one reserved id.
   std::vector<uint8_t> mask;
-  if (group_id != 0) {
-    for (uint8_t id : members) {
-      if (id < 1) {
-        ESP_LOGW(TAG, "Ignoring out-of-range dynamic group member id %u (must be >= 1)", (unsigned) id);
-        continue;
-      }
-      const size_t byte = (size_t) (id - 1) / 8;
-      if (mask.size() <= byte)
-        mask.resize(byte + 1, 0);
-      mask[byte] |= 1 << ((id - 1) % 8);
+  for (uint8_t id : members) {
+    if (id < 1) {
+      ESP_LOGW(TAG, "Ignoring out-of-range dynamic group member id %u (must be >= 1)", (unsigned) id);
+      continue;
     }
+    const size_t byte = (size_t) (id - 1) / 8;
+    if (mask.size() <= byte)
+      mask.resize(byte + 1, 0);
+    mask[byte] |= 1 << ((id - 1) % 8);
   }
 
   std::vector<uint8_t> light_data;
@@ -934,15 +958,10 @@ void FastconController::dynamic_group_command(uint8_t group_id, const std::vecto
     };
   }
 
-  // Same time-sync bracketing + queueGroupCommand() order as FastconLight::write_state()'s
-  // own group path - see that method's own comments (fastcon_light.cpp) for why.
-  // queueGroupCommand() itself already no-ops its membership half on an empty mask (group
-  // 0's own case, per the guard above, and any group_id passed with no members).
-  //
   // Captured by value, not by reference: this same lambda is also handed to
   // schedule_retransmits() below and can run again 1-5 seconds from now, well after this
   // call's own arguments have gone out of scope.
-  auto send_group = [this, group_id, mask, members, light_data, state, brightness]() {
+  auto send_group = [this, mask, members, light_data, state, brightness]() {
     // Queue depth BEFORE this dispatch's own frames go in (2026-09-07) - reveals a
     // backlog this dispatch is landing behind, not just what it adds. See this file's
     // own header note on last_heartbeat_ms_/log_heartbeat_() for why: at 150ms/frame
@@ -950,25 +969,23 @@ void FastconController::dynamic_group_command(uint8_t group_id, const std::vecto
     // means its own frames sit far longer than this log line's own timestamp implies.
     const size_t queue_size_before = this->get_queue_size();
     this->send_time_sync();
+    // Re-provision the scratch slot's membership on every call (cmd 5, since group_id ==
+    // SCRATCH_GROUP_ID) - unlike a permanent group (command_static_group(), never rewritten
+    // after boot), an ad-hoc set can be different every single call, so there is no boot-time
+    // provisioning to rely on here. ensure_group() itself no-ops on an empty mask for this
+    // slot (an empty `members` list stays the documented "no-op" for dynamic groups, matching
+    // command_static_group()'s different, deliberate "dissolve" meaning for a REAL group_id).
+    this->ensure_group(group_id, mask);
     auto payload = this->queueGroupCommand(group_id, mask, light_data);
     this->send_time_sync();
 
     // The group frame is on its way; now make the individual entities agree with it, so a
     // reconciler sees per-light state rather than lights it believes are unchanged.
-    //
-    // Group 0 is the hardwired all-lights group: it needs no membership write and it
-    // commands every bulb on the mesh, including any the caller did not list. Publishing
-    // only the listed members would leave the rest showing stale state while physically
-    // having changed - so publish onto every single-light entity instead, via the 0
-    // sentinel. This matters as soon as lights exist that the presets do not enumerate.
-    if (group_id == 0)
-      this->publish_group_members({0}, light_data);
-    else
-      this->publish_group_members(members, light_data);
+    this->publish_group_members(members, light_data);
 
-    ESP_LOGD(TAG, "Dynamic group command: group=%u members=%zu state=%d brightness=%u payload_len=%d "
+    ESP_LOGD(TAG, "Dynamic group command: members=%zu state=%d brightness=%u payload_len=%d "
                   "queue_before=%zu queue_after=%zu",
-             (unsigned) group_id, members.size(), (int) state, (unsigned) brightness, (int) payload.size(),
+             members.size(), (int) state, (unsigned) brightness, (int) payload.size(),
              queue_size_before, this->get_queue_size());
   };
 
@@ -987,14 +1004,71 @@ void FastconController::dynamic_group_command(uint8_t group_id, const std::vecto
   //
   // Scheduled ONE PER MEMBER, keyed by that member's own light_id - deliberately NOT keyed
   // by this group_id. This is what makes "last command wins, per bulb" correct even across
-  // two DIFFERENT group_ids that happen to share a bulb (e.g. group 50 then group 60,
-  // issued back to back, both including the same physical light): schedule_retransmits()
-  // already supersedes any existing entry with the same target_key, and here the
-  // target_key IS the physical bulb, not whichever group most recently addressed it - so a
-  // later command (group OR individual) naturally overwrites an earlier one's pending
-  // retransmit for a shared bulb, with no cross-group bookkeeping needed at all. A bulb
-  // that group 60 does NOT include keeps group 50's own still-pending retransmit
-  // untouched, which is correct too - nothing has told that bulb anything different since.
+  // a dynamic dispatch and a permanent group's own command_static_group() call that happen to
+  // share a bulb: schedule_retransmits() already supersedes any existing entry with the same
+  // target_key, and here the target_key IS the physical bulb, not whichever group most
+  // recently addressed it - so a later command (either mechanism, or an individual one)
+  // naturally overwrites an earlier one's pending retransmit for a shared bulb, with no
+  // cross-mechanism bookkeeping needed at all.
+  for (uint8_t id : members) {
+    this->schedule_retransmits((uint16_t) id, [this, id, light_data]() {
+      auto payload = this->single_control(id, light_data);
+      this->queueCommand(id, payload);
+      ESP_LOGD(TAG, "Retransmitting light %u individually", (unsigned) id);
+    });
+  }
+}
+
+// Permanent groups (2026-09-07): membership was already written once, at boot (setup()'s own
+// comment) - this sends nothing but the cmd-3 control frame, the same "commanding a group no
+// longer defines it" split queueGroupCommand() itself now enforces for every caller. No
+// `members` parameter: `static_group_members_`/`group_masks_` (populated at boot) already
+// know who is in `group_id`, which is the entire point of a caller only needing the id.
+void FastconController::command_static_group(uint8_t group_id, bool state, uint8_t brightness,
+                                               uint8_t blue, uint8_t red, uint8_t green,
+                                               uint8_t warm, uint8_t cold) {
+  auto members_it = this->static_group_members_.find(group_id);
+  if (members_it == this->static_group_members_.end()) {
+    ESP_LOGW(TAG, "command_static_group: group %u was never defined in `fastcon: groups:` config",
+             (unsigned) group_id);
+  }
+  const std::vector<uint8_t> members =
+      (members_it != this->static_group_members_.end()) ? members_it->second : std::vector<uint8_t>{};
+
+  auto mask_it = this->group_masks_.find(group_id);
+  const std::vector<uint8_t> mask =
+      (mask_it != this->group_masks_.end()) ? mask_it->second.mask : std::vector<uint8_t>{};
+
+  std::vector<uint8_t> light_data;
+  if (!state) {
+    light_data = {0x00};
+  } else {
+    light_data = {
+        static_cast<uint8_t>(0x80 | (brightness & 0x7F)),
+        blue, red, green, warm, cold,
+    };
+  }
+
+  auto send_group = [this, group_id, mask, members, light_data, state, brightness]() {
+    const size_t queue_size_before = this->get_queue_size();
+    this->send_time_sync();
+    // Control-only - see queueGroupCommand()'s own comment. `mask` here only feeds the
+    // supersede rules (queueCommand()'s own comment); it asserts nothing about the mesh.
+    auto payload = this->queueGroupCommand(group_id, mask, light_data);
+    this->send_time_sync();
+    this->publish_group_members(members, light_data);
+    ESP_LOGD(TAG, "Static group command: group=%u members=%zu state=%d brightness=%u payload_len=%d "
+                  "queue_before=%zu queue_after=%zu",
+             (unsigned) group_id, members.size(), (int) state, (unsigned) brightness, (int) payload.size(),
+             queue_size_before, this->get_queue_size());
+  };
+
+  send_group();
+
+  // Same +1s/+5s individual-retransmit fallback as dynamic_group_command() - see that
+  // method's own comment for why it addresses bulbs individually rather than repeating the
+  // group frame, and why keying by light_id (not group_id) is what keeps "last command wins,
+  // per bulb" correct across the two mechanisms.
   for (uint8_t id : members) {
     this->schedule_retransmits((uint16_t) id, [this, id, light_data]() {
       auto payload = this->single_control(id, light_data);

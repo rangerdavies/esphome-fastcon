@@ -25,6 +25,16 @@ CONF_RETRANSMIT_DELAYS = "retransmit_delays"
 CONF_SKIP_TRACKED_MEMBERSHIP = "skip_tracked_membership"
 CONF_MEMBERSHIP_REPEAT_GAP = "membership_repeat_gap"
 
+# `fastcon: groups:` - permanent groups, provisioned once at boot (2026-09-07, per direct
+# request: "pre-defined groups have a groupId and member lights defined in brmesh-bridge...
+# on start-up the esp32 device should write these permanent groups to the lights"). Moved up
+# here (shared with fastcon.define_group's own schema below, which provisions a group the
+# same way but on demand from an automation instead of once at boot) rather than duplicated.
+CONF_GROUP_ID = "group_id"
+CONF_MEMBERS = "members"
+CONF_GROUPS = "groups"
+MAX_LIGHT_ID = 255
+
 DEFAULT_ADV_INTERVAL_MIN = 0x20
 DEFAULT_ADV_INTERVAL_MAX = 0x40
 DEFAULT_ADV_DURATION = 50
@@ -91,6 +101,18 @@ def validate_hex_bytes(value):
 fastcon_ns = cg.esphome_ns.namespace("fastcon")
 FastconController = fastcon_ns.class_("FastconController", cg.Component)
 
+# One entry of `fastcon: groups:` - a permanent group, provisioned once at boot with cmd 1
+# (FastconController::setup(), fastcon_controller.cpp) and addressed afterward by `group_id`
+# alone, with no membership write per command - see command_static_group()'s own comment
+# (fastcon_controller.h). `members` are raw mesh light_ids, same numbering as every other
+# members: list in this component (NOT the HA-facing "Light N" numbering scripts.yaml uses).
+GROUP_SCHEMA = cv.Schema(
+    {
+        cv.Required(CONF_GROUP_ID): cv.int_range(min=1, max=MAX_LIGHT_ID),
+        cv.Required(CONF_MEMBERS): cv.ensure_list(cv.int_range(min=1, max=MAX_LIGHT_ID)),
+    }
+)
+
 CONFIG_SCHEMA = cv.Schema(
     {
         cv.Optional(CONF_ID, default="fastcon_controller"): cv.declare_id(
@@ -117,6 +139,10 @@ CONFIG_SCHEMA = cv.Schema(
         cv.Optional(CONF_GROUP_SLOT, default=DEFAULT_GROUP_SLOT): cv.int_range(
             min=1, max=255
         ),
+        # Permanent groups (2026-09-07) - see GROUP_SCHEMA's own comment. Cross-checked
+        # against CONF_GROUP_SLOT and against each other for duplicates in to_code() below,
+        # since that needs config[CONF_GROUP_SLOT] alongside this list.
+        cv.Optional(CONF_GROUPS, default=[]): cv.ensure_list(GROUP_SCHEMA),
         # Optional - live test of whether bracketing a group action with a cmd-9
         # time-sync frame (matching the app's own observed habit) improves membership-
         # write/group-control reception. No effect on single-light entities.
@@ -184,6 +210,25 @@ async def to_code(config):
     cg.add(var.set_skip_tracked_membership(config[CONF_SKIP_TRACKED_MEMBERSHIP]))
     cg.add(var.set_membership_repeat_gap(config[CONF_MEMBERSHIP_REPEAT_GAP]))
 
+    # Permanent groups (2026-09-07) - registered here, provisioned at boot by
+    # FastconController::setup() itself (fastcon_controller.cpp). group_slot is the ad-hoc
+    # scratch id (cmd 5, rewritten every dynamic_group_command() call) - a permanent group
+    # reusing it would silently fight every dynamic dispatch for the same mesh slot, so it's
+    # rejected here rather than left to be found live.
+    seen_group_ids = set()
+    for group in config[CONF_GROUPS]:
+        group_id = group[CONF_GROUP_ID]
+        if group_id == config[CONF_GROUP_SLOT]:
+            raise cv.Invalid(
+                f"groups: group_id {group_id} collides with group_slot "
+                f"({config[CONF_GROUP_SLOT]}) - that id is reserved for ad-hoc/dynamic "
+                "groups (cmd 5); pick a different id for a permanent group (cmd 1)."
+            )
+        if group_id in seen_group_ids:
+            raise cv.Invalid(f"groups: group_id {group_id} is defined more than once")
+        seen_group_ids.add(group_id)
+        cg.add(var.add_static_group(group_id, group[CONF_MEMBERS]))
+
     if config[CONF_SNIFFER]:
         cg.add(var.set_sniffer_enabled(True))
         await esp32_ble_tracker.register_ble_device(var, config)
@@ -214,10 +259,8 @@ async def to_code(config):
 #
 # An empty `members` list dissolves the group. group_id 0 is rejected here rather than at
 # runtime - it is the firmware's own all-lights group and has no membership to write.
-CONF_GROUP_ID = "group_id"
-CONF_MEMBERS = "members"
+# (CONF_GROUP_ID/CONF_MEMBERS/MAX_LIGHT_ID moved up top, shared with `fastcon: groups:`.)
 CONF_CONTROLLER_ID = "controller_id"
-MAX_LIGHT_ID = 255
 
 DefineGroupAction = fastcon_ns.class_("DefineGroupAction", automation.Action)
 
